@@ -58,12 +58,17 @@ if [ "$PLATFORM" = "Linux" ]; then
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
+    OMP_CFLAGS=(-fopenmp)
+    OMP_LDFLAGS=()
 else
     RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
+    # Apple Clang needs -Xpreprocessor -fopenmp and explicit libomp paths
+    OMP_CFLAGS=(-Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include)
+    OMP_LDFLAGS=(-L/opt/homebrew/opt/libomp/lib -lomp)
 fi
 
 CLANG_WARN=(
@@ -140,9 +145,14 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
         "${LINK_ARCHIVES[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread
+        ${OMP_CFLAGS[@]+"${OMP_CFLAGS[@]}"} ${OMP_LDFLAGS[@]+"${OMP_LDFLAGS[@]}"}
         -DPLATFORM_DESKTOP
     )
+    # Fall back to -fopenmp on Linux where OMP_CFLAGS is unset
+    if [ -z "${OMP_CFLAGS+x}" ]; then
+        FLAGS+=(-fopenmp)
+    fi
     echo "Compiling $ENV..."
     ${CC:-clang} "${CLANG_OPT[@]}" "${FLAGS[@]}"
     echo "Built: ./$OUTPUT_NAME"
@@ -220,7 +230,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    -fPIC "${OMP_CFLAGS[@]}" \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -261,7 +271,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC "${OMP_CFLAGS[@]}" \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -272,7 +282,7 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC "${OMP_CFLAGS[@]}" "${OMP_LDFLAGS[@]}"
         build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
         -lm -lpthread $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
