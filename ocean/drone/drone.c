@@ -31,7 +31,10 @@ int main() {
     srand(time(NULL));
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
-    size_t obs_size = 23;
+    // Observation buffer uses 30 to match compute_observations() stride.
+    // The pre-trained HOVER network only reads the first 23 obs.
+    size_t obs_size = 30;
+    size_t net_obs_size = 23; // network input size for pre-trained weights
 
     env->num_agents = 16;
     env->max_rings = 10;
@@ -44,6 +47,12 @@ int main() {
     env->hover_dist = 0.1f;
     env->hover_omega = 0.1f;
     env->hover_vel = 0.1f;
+    env->num_chasers = 12;
+    env->capture_radius = 0.5f;
+    env->alpha_chase = 1.0f;
+    env->alpha_capture = 10.0f;
+    env->alpha_survive = 0.01f;
+    env->alpha_evade = 0.1f;
 
     env->observations = (float*)calloc(env->num_agents * obs_size, sizeof(float));
     env->actions = (float*)calloc(env->num_agents * 4, sizeof(float));
@@ -53,7 +62,7 @@ int main() {
     Weights* weights = load_weights("resources/drone/drone_weights.bin");
     int logit_sizes[4] = {1, 1, 1, 1};
     // make_puffernet(weights, num_agents, obs_size, hidden_size, num_layers, logit_sizes, num_actions)
-    PufferNet* net = make_puffernet(weights, env->num_agents, obs_size, 128, 3, logit_sizes, 4);
+    PufferNet* net = make_puffernet(weights, env->num_agents, net_obs_size, 128, 3, logit_sizes, 4);
 
     init(env);
     c_reset(env);

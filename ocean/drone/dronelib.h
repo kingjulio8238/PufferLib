@@ -67,6 +67,8 @@ struct Log {
     float ema_dist;
     float ema_vel;
     float ema_omega;
+    float captures;
+    float evader_survival;
     float n;
 };
 
@@ -152,6 +154,8 @@ typedef struct {
     float ema_dist;
     float ema_vel;
     float ema_omega;
+    float prev_chase_dist;
+    int prev_nearest_opponent;
 } Drone;
 
 static inline float clampf(float v, float min, float max) {
@@ -529,6 +533,65 @@ static inline bool check_collision(Drone* agent, Drone* others, int num_agents) 
     float nearest_dist = norm3(to_nearest);
 
     return nearest_dist < 0.1f;
+}
+
+// Find nearest opponent distance and index (for chasers: search evaders, for evaders: search chasers)
+static inline float nearest_opponent_dist(Drone* agent, Drone* agents,
+                                          int search_start, int search_end,
+                                          int* out_idx) {
+    float min_dist = FLT_MAX;
+    int best_idx = -1;
+    for (int i = search_start; i < search_end; i++) {
+        if (&agents[i] == agent) continue;
+        float d = norm3(sub3(agent->state.pos, agents[i].state.pos));
+        if (d < min_dist) {
+            min_dist = d;
+            best_idx = i;
+        }
+    }
+    if (out_idx) *out_idx = best_idx;
+    return min_dist;
+}
+
+// Find nearest two opponents and write their relative positions (body frame)
+static inline void nearest_two_opponent_obs(Drone* agent, Drone* agents,
+                                            int search_start, int search_end,
+                                            float* obs_out) {
+    float dist1 = FLT_MAX, dist2 = FLT_MAX;
+    Vec3 pos1 = {0}, pos2 = {0};
+
+    for (int i = search_start; i < search_end; i++) {
+        if (&agents[i] == agent) continue;
+        float d = norm3(sub3(agents[i].state.pos, agent->state.pos));
+        if (d < dist1) {
+            dist2 = dist1; pos2 = pos1;
+            dist1 = d; pos1 = agents[i].state.pos;
+        } else if (d < dist2) {
+            dist2 = d; pos2 = agents[i].state.pos;
+        }
+    }
+
+    Quat q_inv = quat_inverse(agent->state.quat);
+
+    // Nearest opponent in body frame
+    if (dist1 < FLT_MAX) {
+        Vec3 rel = quat_rotate(q_inv, sub3(pos1, agent->state.pos));
+        obs_out[0] = tanhf(rel.x * 0.1f);
+        obs_out[1] = tanhf(rel.y * 0.1f);
+        obs_out[2] = tanhf(rel.z * 0.1f);
+    } else {
+        obs_out[0] = obs_out[1] = obs_out[2] = 0.0f;
+    }
+
+    // 2nd nearest opponent in body frame
+    if (dist2 < FLT_MAX) {
+        Vec3 rel = quat_rotate(q_inv, sub3(pos2, agent->state.pos));
+        obs_out[3] = tanhf(rel.x * 0.1f);
+        obs_out[4] = tanhf(rel.y * 0.1f);
+        obs_out[5] = tanhf(rel.z * 0.1f);
+    } else {
+        obs_out[3] = obs_out[4] = obs_out[5] = 0.0f;
+    }
 }
 
 float hover_potential(Drone* agent, float hover_dist, float hover_omega, float hover_vel) {

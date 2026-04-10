@@ -46,6 +46,16 @@ struct DroneEnv {
     float hover_dist;
     float hover_omega;
     float hover_vel;
+
+    // chase task parameters
+    int num_chasers;
+    float capture_radius;
+    float alpha_chase;
+    float alpha_capture;
+    float alpha_survive;
+    float alpha_evade;
+    int captures;
+    int evaders_remaining;
 };
 
 void init(DroneEnv* env) {
@@ -85,11 +95,27 @@ void add_log(DroneEnv* env, int idx, bool oob, bool timeout) {
     agent->collisions = 0.0f;
     agent->score = 0.0f;
     agent->rings_passed = 0.0f;
+    agent->prev_chase_dist = 0.0f;
 }
 
 void compute_observations(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++) {
-        compute_drone_observations(&env->agents[i], env->observations + i*23);
+        float* obs = env->observations + i * 30;
+        // Base 23 observations (velocity, orientation, target, RPMs)
+        compute_drone_observations(&env->agents[i], obs);
+
+        // Chase-specific observations (indices 23-29)
+        if (env->task == CHASE) {
+            bool is_chaser = (i < env->num_chasers);
+            int search_start = is_chaser ? env->num_chasers : 0;
+            int search_end = is_chaser ? env->num_agents : env->num_chasers;
+            nearest_two_opponent_obs(&env->agents[i], env->agents,
+                                     search_start, search_end, obs + 23);
+            obs[29] = is_chaser ? 0.0f : 1.0f;
+        } else {
+            // Zero-fill for non-chase tasks
+            for (int j = 23; j < 30; j++) obs[j] = 0.0f;
+        }
     }
 }
 
@@ -104,14 +130,32 @@ void reset_agent(DroneEnv* env, Drone* agent, int idx) {
     agent->ema_dist = 0.0f;
     agent->ema_vel = 0.0f;
     agent->ema_omega = 0.0f;
+    agent->prev_chase_dist = 0.0f;
+    agent->prev_nearest_opponent = -1;
 
     agent->buffer = env->ring_buffer;
     agent->buffer_size = env->max_rings;
 
     init_drone(agent, &env->rng, 0.05f);
 
-    agent->state.pos =
-        (Vec3){rndf(-MARGIN_X, MARGIN_X, &env->rng), rndf(-MARGIN_Y, MARGIN_Y, &env->rng), rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+    if (env->task == CHASE) {
+        // Spawn chasers and evaders on opposite sides
+        bool is_chaser = (idx < env->num_chasers);
+        if (is_chaser) {
+            agent->state.pos = (Vec3){
+                rndf(-MARGIN_X, -2.0f, &env->rng),
+                rndf(-MARGIN_Y, MARGIN_Y, &env->rng),
+                rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+        } else {
+            agent->state.pos = (Vec3){
+                rndf(2.0f, MARGIN_X, &env->rng),
+                rndf(-MARGIN_Y, MARGIN_Y, &env->rng),
+                rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+        }
+    } else {
+        agent->state.pos =
+            (Vec3){rndf(-MARGIN_X, MARGIN_X, &env->rng), rndf(-MARGIN_Y, MARGIN_Y, &env->rng), rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+    }
 
     if (env->task == RACE) {
         while (norm3(sub3(agent->state.pos, env->ring_buffer[0].pos)) < 2.0f * RING_RADIUS) {
@@ -129,10 +173,16 @@ void c_reset(DroneEnv* env) {
         reset_rings(&env->rng, env->ring_buffer, env->max_rings);
     }
 
+    if (env->task == CHASE) {
+        env->captures = 0;
+        env->evaders_remaining = env->num_agents - env->num_chasers;
+    }
+
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
         reset_agent(env, agent, i);
-        set_target(&env->rng, env->task, env->agents, i, env->num_agents, env->hover_target_dist);
+        set_target(&env->rng, env->task, env->agents, i, env->num_agents,
+                   env->hover_target_dist, env->num_chasers);
     }
 
     compute_observations(env);
@@ -141,6 +191,20 @@ void c_reset(DroneEnv* env) {
 void c_step(DroneEnv* env) {
     env->tick = (env->tick + 1) % HORIZON;
 
+    // Chase pre-pass: detect captures ONCE per evader to avoid double counting
+    bool evader_captured[256] = {false}; // max agents
+    if (env->task == CHASE) {
+        for (int e = env->num_chasers; e < env->num_agents; e++) {
+            float min_dist = nearest_opponent_dist(
+                &env->agents[e], env->agents, 0, env->num_chasers, NULL);
+            if (min_dist < env->capture_radius) {
+                evader_captured[e] = true;
+                env->captures++;
+                env->log.captures += 1.0f;
+            }
+        }
+    }
+
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
 
@@ -148,25 +212,99 @@ void c_step(DroneEnv* env) {
         move_drone(agent, &env->actions[4 * i]);
         agent->episode_length++;
 
-        bool oob = norm3(sub3(agent->target->pos, agent->state.pos)) > (env->hover_target_dist + 1.0f);
+        float omega = norm3(agent->state.omega);
+        float reward;
+        bool oob;
         bool timeout = (agent->episode_length >= HORIZON);
 
-        float curr = hover_potential(agent, env->hover_dist, env->hover_omega, env->hover_vel);
-        float prev_dist = norm3(sub3(agent->target->pos, agent->prev_pos));
-        float curr_dist = norm3(sub3(agent->target->pos, agent->state.pos));
-        float omega = norm3(agent->state.omega);
+        if (env->task == CHASE) {
+            // Update chase targets dynamically every step
+            set_target_chase(env->agents, i, env->num_agents, env->num_chasers);
 
-        float reward = env->alpha_dist * (prev_dist - curr_dist)
-                     + env->alpha_hover * curr
-                     + env->alpha_shaping * (curr - agent->prev_potential)
-                     - env->alpha_omega * omega;
-        
-        agent->prev_potential = curr;
+            bool is_chaser = (i < env->num_chasers);
+            bool captured = false;
 
-        float h = check_hover(agent, env->hover_dist, env->hover_omega, env->hover_vel);
-        agent->hover_score += h;
-        agent->hover_ema = (1.0f - 0.02f) * agent->hover_ema + 0.02f * h;
-        agent->ema_dist = 0.99f * agent->ema_dist + 0.01f * curr_dist;
+            if (is_chaser) {
+                // Chaser reward: distance shaping toward nearest evader
+                int nearest_idx = -1;
+                float min_evader_dist = nearest_opponent_dist(
+                    agent, env->agents, env->num_chasers, env->num_agents, &nearest_idx);
+
+                // Only apply shaping if tracking the same opponent (avoids spurious rewards)
+                if (agent->prev_chase_dist > 0.0f && nearest_idx == agent->prev_nearest_opponent) {
+                    reward = env->alpha_chase * (agent->prev_chase_dist - min_evader_dist);
+                } else {
+                    reward = 0.0f;
+                }
+                agent->prev_chase_dist = min_evader_dist;
+                agent->prev_nearest_opponent = nearest_idx;
+
+                // Capture bonus: team reward if ANY evader was captured this step
+                for (int e = env->num_chasers; e < env->num_agents; e++) {
+                    if (evader_captured[e]) {
+                        reward += env->alpha_capture;
+                        break; // one bonus per chaser per step
+                    }
+                }
+
+                // OOB: arena bounds with penalty
+                oob = fabsf(agent->state.pos.x) > GRID_X ||
+                      fabsf(agent->state.pos.y) > GRID_Y ||
+                      fabsf(agent->state.pos.z) > GRID_Z;
+                if (oob) reward -= 1.0f;
+            } else {
+                // Evader reward: delta-based distance shaping + survival
+                int nearest_idx = -1;
+                float min_chaser_dist = nearest_opponent_dist(
+                    agent, env->agents, 0, env->num_chasers, &nearest_idx);
+
+                reward = env->alpha_survive;
+                // Delta-based: reward for increasing distance from nearest chaser
+                if (agent->prev_chase_dist > 0.0f && nearest_idx == agent->prev_nearest_opponent) {
+                    reward += env->alpha_evade * (min_chaser_dist - agent->prev_chase_dist);
+                }
+                agent->prev_chase_dist = min_chaser_dist;
+                agent->prev_nearest_opponent = nearest_idx;
+                env->log.evader_survival += 1.0f;
+
+                // Captured = forced reset (detected in pre-pass)
+                captured = evader_captured[i];
+
+                // OOB: arena bounds with penalty
+                oob = fabsf(agent->state.pos.x) > GRID_X ||
+                      fabsf(agent->state.pos.y) > GRID_Y ||
+                      fabsf(agent->state.pos.z) > GRID_Z;
+
+                if (captured) {
+                    reward = -5.0f; // strong penalty for being caught
+                }
+                if (oob) reward -= 1.0f;
+            }
+
+            reward -= env->alpha_omega * omega;
+            oob = oob || captured;
+        } else {
+            // Original reward logic for all other tasks
+            oob = norm3(sub3(agent->target->pos, agent->state.pos)) > (env->hover_target_dist + 1.0f);
+
+            float curr = hover_potential(agent, env->hover_dist, env->hover_omega, env->hover_vel);
+            float prev_dist = norm3(sub3(agent->target->pos, agent->prev_pos));
+            float curr_dist = norm3(sub3(agent->target->pos, agent->state.pos));
+
+            reward = env->alpha_dist * (prev_dist - curr_dist)
+                   + env->alpha_hover * curr
+                   + env->alpha_shaping * (curr - agent->prev_potential)
+                   - env->alpha_omega * omega;
+
+            agent->prev_potential = curr;
+
+            float h = check_hover(agent, env->hover_dist, env->hover_omega, env->hover_vel);
+            agent->hover_score += h;
+            agent->hover_ema = (1.0f - 0.02f) * agent->hover_ema + 0.02f * h;
+            float curr_dist2 = norm3(sub3(agent->target->pos, agent->state.pos));
+            agent->ema_dist = 0.99f * agent->ema_dist + 0.01f * curr_dist2;
+        }
+
         agent->ema_vel = 0.99f * agent->ema_vel + 0.01f * norm3(agent->state.vel);
         agent->ema_omega = 0.99f * agent->ema_omega + 0.01f * omega;
         agent->episode_return += reward;
@@ -178,7 +316,8 @@ void c_step(DroneEnv* env) {
         if (reset) {
             add_log(env, i, oob, timeout);
             reset_agent(env, agent, i);
-            set_target(&env->rng, env->task, env->agents, i, env->num_agents, env->hover_target_dist);
+            set_target(&env->rng, env->task, env->agents, i, env->num_agents,
+                       env->hover_target_dist, env->num_chasers);
         }
     }
 

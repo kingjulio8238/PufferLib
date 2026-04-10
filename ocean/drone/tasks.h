@@ -19,11 +19,12 @@ typedef enum {
     CONGO,
     FLAG,
     RACE,
+    CHASE,
     TASK_N // Should always be last
 } DroneTask;
 
 static char const* TASK_NAMES[TASK_N] = {"idle", "hover", "orbit", "follow",
-                                         "cube", "congo", "flag",  "race"};
+                                         "cube", "congo", "flag",  "race", "chase"};
 
 DroneTask get_task(char* task_name) {
     for (size_t i = 0; i < TASK_N; i++) {
@@ -143,7 +144,49 @@ void set_target_flag(Drone* agent, int idx) {
 
 void set_target_race(Drone* agent) { *agent->target = agent->buffer[agent->buffer_idx]; }
 
-void set_target(unsigned int* rng, DroneTask task, Drone* agents, int idx, int num_agents, float hover_target_dist) {
+// Update chase target: chasers aim at nearest evader, evaders flee nearest chaser
+void set_target_chase(Drone* agents, int idx, int num_agents, int num_chasers) {
+    Drone* agent = &agents[idx];
+    bool is_chaser = (idx < num_chasers);
+
+    if (is_chaser) {
+        // Chaser: target = nearest evader
+        float min_dist = FLT_MAX;
+        for (int i = num_chasers; i < num_agents; i++) {
+            float d = norm3(sub3(agent->state.pos, agents[i].state.pos));
+            if (d < min_dist) {
+                min_dist = d;
+                agent->target->pos = agents[i].state.pos;
+            }
+        }
+    } else {
+        // Evader: target = flee away from nearest chaser
+        float min_dist = FLT_MAX;
+        Vec3 nearest_pos = agent->state.pos;
+        for (int i = 0; i < num_chasers; i++) {
+            float d = norm3(sub3(agent->state.pos, agents[i].state.pos));
+            if (d < min_dist) {
+                min_dist = d;
+                nearest_pos = agents[i].state.pos;
+            }
+        }
+        Vec3 flee_dir = sub3(agent->state.pos, nearest_pos);
+        float flee_norm = norm3(flee_dir);
+        if (flee_norm > 0.01f) {
+            flee_dir = scalmul3(flee_dir, 5.0f / flee_norm);
+        }
+        Vec3 flee_pos = add3(agent->state.pos, flee_dir);
+        agent->target->pos = (Vec3){
+            clampf(flee_pos.x, -MARGIN_X, MARGIN_X),
+            clampf(flee_pos.y, -MARGIN_Y, MARGIN_Y),
+            clampf(flee_pos.z, -MARGIN_Z, MARGIN_Z)
+        };
+    }
+    agent->target->vel = (Vec3){0, 0, 0};
+}
+
+void set_target(unsigned int* rng, DroneTask task, Drone* agents, int idx, int num_agents,
+                float hover_target_dist, int num_chasers) {
     Drone* agent = &agents[idx];
 
     if (task == IDLE) set_target_idle(rng, agent);
@@ -154,4 +197,5 @@ void set_target(unsigned int* rng, DroneTask task, Drone* agents, int idx, int n
     else if (task == CONGO) set_target_congo(rng, agents, idx);
     else if (task == FLAG) set_target_flag(agent, idx);
     else if (task == RACE) set_target_race(agent);
+    else if (task == CHASE) set_target_chase(agents, idx, num_agents, num_chasers);
 }

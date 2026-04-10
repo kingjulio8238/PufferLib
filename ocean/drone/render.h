@@ -433,7 +433,8 @@ void c_render(DroneEnv* env) {
         }
 
         for (int i = 0; i < env->num_agents; i++) {
-            set_target(&env->rng, env->task, env->agents, i, env->num_agents, env->hover_target_dist);
+            set_target(&env->rng, env->task, env->agents, i, env->num_agents,
+                       env->hover_target_dist, env->num_chasers);
         }
     }
 
@@ -524,7 +525,15 @@ void c_render(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
         bool is_selected = (i == client->selected_drone);
-        Color body_color = (inspect_mode && is_selected) ? PUFF_GREEN : COLORS[i % 64];
+        Color body_color;
+        if (env->task == CHASE) {
+            bool is_chaser = (i < env->num_chasers);
+            body_color = (inspect_mode && is_selected) ? PUFF_GREEN
+                       : is_chaser ? (Color){255, 60, 60, 255}
+                                   : (Color){60, 120, 255, 255};
+        } else {
+            body_color = (inspect_mode && is_selected) ? PUFF_GREEN : COLORS[i % 64];
+        }
 
         if (client->render_mode == 2) {
             // Minimal mode: draw small sphere matching hover_dist size
@@ -581,6 +590,15 @@ void c_render(DroneEnv* env) {
         }
     }
 
+    // Chase mode: capture radius around evaders
+    if (env->task == CHASE) {
+        for (int i = env->num_chasers; i < env->num_agents; i++) {
+            Vec3 p = env->agents[i].state.pos;
+            DrawSphereWires((Vector3){p.x, p.y, p.z}, env->capture_radius,
+                            8, 8, ColorAlpha(BLUE, 0.3f));
+        }
+    }
+
     // Targets (shown in inspect mode) - size based on render mode
     if (inspect_mode) {
         float target_size;
@@ -610,6 +628,12 @@ void c_render(DroneEnv* env) {
     int y = 10;
     DrawText(TextFormat("Task: %s", TASK_NAMES[env->task]), 10, y, 20, WHITE);
     y += 25;
+    if (env->task == CHASE) {
+        int num_evaders = env->num_agents - env->num_chasers;
+        DrawText(TextFormat("Captures: %d | Chasers: %d | Evaders: %d",
+                            env->captures, env->num_chasers, num_evaders), 10, y, 18, YELLOW);
+        y += 22;
+    }
     DrawText(TextFormat("Tick: %d / %d", env->tick, HORIZON), 10, y, 20, WHITE);
     y += 25;
     DrawText(TextFormat("FPS: %d (W/S to adjust)", client->target_fps), 10, y, 18, WHITE);

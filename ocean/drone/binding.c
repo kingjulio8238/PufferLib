@@ -1,7 +1,7 @@
 #include "drone.h"
 #include "render.h"
 
-#define OBS_SIZE 23
+#define OBS_SIZE 30
 #define NUM_ATNS 4
 #define ACT_SIZES {1, 1, 1, 1}
 #define OBS_TENSOR_T FloatTensor
@@ -21,6 +21,12 @@ void my_init(Env* env, Dict* kwargs) {
     env->hover_dist = dict_get(kwargs, "hover_dist")->value;
     env->hover_omega = dict_get(kwargs, "hover_omega")->value;
     env->hover_vel = dict_get(kwargs, "hover_vel")->value;
+    env->num_chasers = (int)dict_get(kwargs, "num_chasers")->value;
+    env->capture_radius = dict_get(kwargs, "capture_radius")->value;
+    env->alpha_chase = dict_get(kwargs, "alpha_chase")->value;
+    env->alpha_capture = dict_get(kwargs, "alpha_capture")->value;
+    env->alpha_survive = dict_get(kwargs, "alpha_survive")->value;
+    env->alpha_evade = dict_get(kwargs, "alpha_evade")->value;
     init(env);
 }
 
@@ -37,4 +43,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "ema_dist", log->ema_dist);
     dict_set(out, "ema_vel", log->ema_vel);
     dict_set(out, "ema_omega", log->ema_omega);
+    dict_set(out, "captures", log->captures);
+    dict_set(out, "evader_survival", log->evader_survival);
 }
