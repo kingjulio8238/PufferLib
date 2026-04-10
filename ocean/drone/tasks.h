@@ -177,9 +177,9 @@ void set_target_chase(Drone* agents, int idx, int num_agents, int num_chasers) {
         }
         Vec3 flee_pos = add3(agent->state.pos, flee_dir);
         agent->target->pos = (Vec3){
-            clampf(flee_pos.x, -MARGIN_X, MARGIN_X),
-            clampf(flee_pos.y, -MARGIN_Y, MARGIN_Y),
-            clampf(flee_pos.z, -MARGIN_Z, MARGIN_Z)
+            clampf(flee_pos.x, -CHASE_X, CHASE_X),
+            clampf(flee_pos.y, -CHASE_Y, CHASE_Y),
+            clampf(flee_pos.z, -CHASE_Z, CHASE_Z)
         };
     }
     agent->target->vel = (Vec3){0, 0, 0};

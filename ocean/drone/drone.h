@@ -14,6 +14,7 @@
 
 #define HORIZON 1024
 
+
 typedef struct Client Client;
 typedef struct DroneEnv DroneEnv;
 
@@ -139,18 +140,18 @@ void reset_agent(DroneEnv* env, Drone* agent, int idx) {
     init_drone(agent, &env->rng, 0.05f);
 
     if (env->task == CHASE) {
-        // Spawn chasers and evaders on opposite sides
+        // Spawn chasers and evaders close together in small arena
         bool is_chaser = (idx < env->num_chasers);
         if (is_chaser) {
             agent->state.pos = (Vec3){
-                rndf(-MARGIN_X, -2.0f, &env->rng),
-                rndf(-MARGIN_Y, MARGIN_Y, &env->rng),
-                rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+                rndf(-6.0f, -1.0f, &env->rng),
+                rndf(-5.0f, 5.0f, &env->rng),
+                rndf(-3.0f, 3.0f, &env->rng)};
         } else {
             agent->state.pos = (Vec3){
-                rndf(2.0f, MARGIN_X, &env->rng),
-                rndf(-MARGIN_Y, MARGIN_Y, &env->rng),
-                rndf(-MARGIN_Z, MARGIN_Z, &env->rng)};
+                rndf(1.0f, 6.0f, &env->rng),
+                rndf(-5.0f, 5.0f, &env->rng),
+                rndf(-3.0f, 3.0f, &env->rng)};
         }
     } else {
         agent->state.pos =
@@ -224,14 +225,25 @@ void c_step(DroneEnv* env) {
             bool is_chaser = (i < env->num_chasers);
             bool captured = false;
 
+            // OOB: clamp position to CHASE arena bounds (no termination)
+            oob = fabsf(agent->state.pos.x) > CHASE_X ||
+                  fabsf(agent->state.pos.y) > CHASE_Y ||
+                  fabsf(agent->state.pos.z) > CHASE_Z;
+            if (oob) {
+                agent->state.pos.x = clampf(agent->state.pos.x, -CHASE_X, CHASE_X);
+                agent->state.pos.y = clampf(agent->state.pos.y, -CHASE_Y, CHASE_Y);
+                agent->state.pos.z = clampf(agent->state.pos.z, -CHASE_Z, CHASE_Z);
+                agent->state.vel = (Vec3){0, 0, 0};
+            }
+
             if (is_chaser) {
                 // Chaser reward: distance shaping toward nearest evader
                 int nearest_idx = -1;
                 float min_evader_dist = nearest_opponent_dist(
                     agent, env->agents, env->num_chasers, env->num_agents, &nearest_idx);
 
-                // Only apply shaping if tracking the same opponent (avoids spurious rewards)
-                if (agent->prev_chase_dist > 0.0f && nearest_idx == agent->prev_nearest_opponent) {
+                // Always apply distance shaping (don't gate on same opponent)
+                if (agent->prev_chase_dist > 0.0f) {
                     reward = env->alpha_chase * (agent->prev_chase_dist - min_evader_dist);
                 } else {
                     reward = 0.0f;
@@ -247,11 +259,8 @@ void c_step(DroneEnv* env) {
                     }
                 }
 
-                // OOB: arena bounds with penalty
-                oob = fabsf(agent->state.pos.x) > GRID_X ||
-                      fabsf(agent->state.pos.y) > GRID_Y ||
-                      fabsf(agent->state.pos.z) > GRID_Z;
-                if (oob) reward -= 1.0f;
+                // Track ema_dist for monitoring
+                agent->ema_dist = 0.99f * agent->ema_dist + 0.01f * min_evader_dist;
             } else {
                 // Evader reward: delta-based distance shaping + survival
                 int nearest_idx = -1;
@@ -259,8 +268,8 @@ void c_step(DroneEnv* env) {
                     agent, env->agents, 0, env->num_chasers, &nearest_idx);
 
                 reward = env->alpha_survive;
-                // Delta-based: reward for increasing distance from nearest chaser
-                if (agent->prev_chase_dist > 0.0f && nearest_idx == agent->prev_nearest_opponent) {
+                // Always apply distance shaping
+                if (agent->prev_chase_dist > 0.0f) {
                     reward += env->alpha_evade * (min_chaser_dist - agent->prev_chase_dist);
                 }
                 agent->prev_chase_dist = min_chaser_dist;
@@ -270,19 +279,17 @@ void c_step(DroneEnv* env) {
                 // Captured = forced reset (detected in pre-pass)
                 captured = evader_captured[i];
 
-                // OOB: arena bounds with penalty
-                oob = fabsf(agent->state.pos.x) > GRID_X ||
-                      fabsf(agent->state.pos.y) > GRID_Y ||
-                      fabsf(agent->state.pos.z) > GRID_Z;
-
                 if (captured) {
                     reward = -5.0f; // strong penalty for being caught
                 }
-                if (oob) reward -= 1.0f;
+
+                // Track ema_dist for monitoring
+                agent->ema_dist = 0.99f * agent->ema_dist + 0.01f * min_chaser_dist;
             }
 
             reward -= env->alpha_omega * omega;
-            oob = oob || captured;
+            // Only terminate on capture (not OOB)
+            oob = captured;
         } else {
             // Original reward logic for all other tasks
             oob = norm3(sub3(agent->target->pos, agent->state.pos)) > (env->hover_target_dist + 1.0f);

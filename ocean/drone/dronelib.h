@@ -39,6 +39,11 @@
 #define MARGIN_X (GRID_X - 1)
 #define MARGIN_Y (GRID_Y - 1)
 #define MARGIN_Z (GRID_Z - 1)
+// Tighter arena bounds for CHASE task
+#define CHASE_X 15.0f
+#define CHASE_Y 15.0f
+#define CHASE_Z 8.0f
+
 #define RING_RADIUS 2.0f
 #define V_TARGET 0.05f
 
