@@ -77,6 +77,9 @@ typedef struct {
     float w_track_lin, w_track_ang;     // positive weights
     float w_lin_vel_z, w_ang_vel_xy;    // negative weights (penalties)
     float w_orientation, w_torque, w_action_rate;
+    float w_alive;          // per-step survival bonus (dt-scaled)
+    float w_termination;    // one-time raw penalty on fall (NOT dt-scaled;
+                            // trainer clamps rewards to +-1)
     float term_height;                  // fall if pelvis z below
     float term_gravity_z;               // fall if proj-gravity z above (toward 0)
 } G1;
@@ -173,6 +176,10 @@ void g1_set_default_config(G1* env) {
     env->w_orientation = -5.0f;
     env->w_torque = -2e-5f;
     env->w_action_rate = -0.01f;
+    env->w_alive = 0.25f;          // 0.005/step after dt scale — small vs
+                                   // tracking's 0.03/step (no camping)
+    env->w_termination = -1.0f;    // dying instantly forfeits ~33 steps of
+                                   // perfect tracking — survival now pays
     env->term_height = 0.35f;
     env->term_gravity_z = -0.6f;       // upright is -1; fall if above (>~53 deg)
 }
@@ -289,7 +296,8 @@ void c_step(G1* env) {
         env->prev_action[j] = a[j];
     }
 
-    float r = env->w_track_lin * track_lin
+    float r = env->w_alive
+            + env->w_track_lin * track_lin
             + env->w_track_ang * track_ang
             + env->w_lin_vel_z * (float)(vel_base[2] * vel_base[2])
             + env->w_ang_vel_xy * (float)(wx * wx + wy * wy)
@@ -310,6 +318,10 @@ void c_step(G1* env) {
     int timeout = env->tick >= env->max_episode_len;
 
     if (fell || timeout) {
+        if (fell) {  // one-time penalty: make falling expensive (raw units)
+            env->rewards[0] += env->w_termination;
+            env->ep_return += env->w_termination;
+        }
         env->terminals[0] = 1.0f;
         add_log(env, fell);
         c_reset(env);

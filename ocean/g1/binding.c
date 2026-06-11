@@ -19,6 +19,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->w_orientation = (float)dict_get(kwargs, "w_orientation")->value;
     env->w_torque = (float)dict_get(kwargs, "w_torque")->value;
     env->w_action_rate = (float)dict_get(kwargs, "w_action_rate")->value;
+    env->w_alive = (float)dict_get(kwargs, "w_alive")->value;
+    env->w_termination = (float)dict_get(kwargs, "w_termination")->value;
     g1_init(env);
 }
 
