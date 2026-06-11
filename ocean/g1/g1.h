@@ -169,15 +169,17 @@ void g1_set_default_config(G1* env) {
     env->cmd_resample_interval = 500;  // 10 s
     env->action_scale = 0.5f;
     env->reset_noise = 0.05f;
-    env->w_track_lin = 1.0f;
-    env->w_track_ang = 0.5f;
+    env->w_track_lin = 2.5f;   // <=0.05/step — secondary objective
+    env->w_track_ang = 1.25f;  // <=0.025/step
     env->w_lin_vel_z = -2.0f;
     env->w_ang_vel_xy = -0.05f;
     env->w_orientation = -5.0f;
     env->w_torque = -2e-5f;
     env->w_action_rate = -0.01f;
-    env->w_alive = 0.25f;          // 0.005/step after dt scale — small vs
-                                   // tracking's 0.03/step (no camping)
+    env->w_alive = 25.0f;          // +0.5/step after dt scale — DOMINANT
+                                   // (ksim ratio: survival >> tracking;
+                                   // standing value at gamma=.995 ~= +100,
+                                   // so falling is implicitly catastrophic)
     env->w_termination = -1.0f;    // dying instantly forfeits ~33 steps of
                                    // perfect tracking — survival now pays
     env->term_height = 0.35f;
