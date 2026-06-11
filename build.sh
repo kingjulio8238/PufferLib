@@ -142,6 +142,30 @@ elif [ "$ENV" = "nethack" ]; then
     fi
     INCLUDES+=(-I./$NLE_DIR/include)
     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
+elif [ "$ENV" = "g1" ]; then
+    SRC_DIR="ocean/$ENV"
+    # MuJoCo C runtime comes from the pinned pip wheel (mujoco==3.9.0): it
+    # ships libmujoco + headers on both linux and macOS. Locate via python.
+    MJ_DIR=""
+    for PY in "$MUJOCO_PYTHON" "../../.venv/bin/python" ".venv/bin/python" python3 python; do
+        [ -z "$PY" ] && continue
+        MJ_DIR="$($PY -c 'import mujoco, os; print(os.path.dirname(mujoco.__file__))' 2>/dev/null)" && [ -n "$MJ_DIR" ] && break
+    done
+    if [ -z "$MJ_DIR" ]; then
+        echo "Error: mujoco python wheel not found (pip install mujoco==3.9.0," \
+             "or set MUJOCO_PYTHON=/path/to/python)" && exit 1
+    fi
+    echo "Using mujoco runtime: $MJ_DIR"
+    INCLUDES+=(-I"$MJ_DIR/include")
+    if [ "$PLATFORM" = "Linux" ]; then
+        MJLIB="$(ls "$MJ_DIR"/libmujoco.so.* 2>/dev/null | head -1)"
+        EXTRA_LDFLAGS+=("$MJLIB" -Wl,-rpath,"$MJ_DIR")
+    else
+        # wheel dylib carries a framework-style install name; satisfy via symlink
+        mkdir -p "$MJ_DIR/mujoco.framework/Versions/A"
+        ln -sf "$MJ_DIR/libmujoco.3.9.0.dylib" "$MJ_DIR/mujoco.framework/Versions/A/libmujoco.3.9.0.dylib"
+        EXTRA_LDFLAGS+=(-L"$MJ_DIR" -lmujoco.3.9.0 -Wl,-rpath,"$MJ_DIR")
+    fi
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
