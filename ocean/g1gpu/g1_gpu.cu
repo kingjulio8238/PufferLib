@@ -307,6 +307,7 @@ static float *p_qpos, *p_qvel, *p_ctrl, *p_xpos, *p_xquat, *p_com, *p_cinert,
 static float *p_ws, *p_qaccF, *p_Ma, *p_qfc, *p_search, *p_Mv;
 static float *p_jaref, *p_force, *p_jv, *p_rpos, *p_D, *p_R, *p_aref, *p_rowsign;
 static float *p_scal, *p_H, *p_cJ, *p_condist;
+static int* p_hvalid;  // H-memo cache flags; nullptr = memo off (large batch)
 static int *p_ncon, *p_nefc, *p_rowtype, *p_rowdof, *p_rowstash, *p_state;
 static float *p_act, *p_prev, *p_cmd, *p_eplog;
 static int* p_tick;
@@ -364,7 +365,16 @@ extern "C" void my_gpu_init(int total_agents, unsigned int seed) {
     G1GPU_MALLOC(p_aref, (size_t)n * NEFC_MAX);
     G1GPU_MALLOC(p_rowsign, (size_t)n * NEFC_MAX);
     G1GPU_MALLOC(p_scal, (size_t)n * NSCAL);
-    G1GPU_MALLOC(p_H, (size_t)n * S_NV * S_NV);
+    G1GPU_MALLOC(p_H, (size_t)n * G1_TRI);  // packed lower-tri factor
+    // H-memoization wins when the cached factors stay L2-resident; above
+    // ~16k envs the k10 active-set read-back costs more than skipped
+    // rebuilds save (measured on GB202). Both paths bit-exact.
+    if (n <= 16384) {
+        CUDA_CHECK(cudaMalloc(&p_hvalid, (size_t)n * 4));
+        CUDA_CHECK(cudaMemset(p_hvalid, 0, (size_t)n * 4));
+    } else {
+        p_hvalid = nullptr;
+    }
     G1GPU_MALLOC(p_cJ, (size_t)n * NCROW_MAX * S_NV);
     G1GPU_MALLOC(p_condist, (size_t)n * NCON_MAX);
     CUDA_CHECK(cudaMalloc(&p_ncon, (size_t)n * 4));
@@ -439,7 +449,8 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     float* aref = p_aref + s * NEFC_MAX;
     float* rowsign = p_rowsign + s * NEFC_MAX;
     float* scal = p_scal + s * NSCAL;
-    float* H = p_H + s * S_NV * S_NV;
+    float* H = p_H + (size_t)s * G1_TRI;
+    int* hvalid = p_hvalid ? p_hvalid + s : nullptr;
     float* cJ = p_cJ + s * NCROW_MAX * S_NV;
     float* condist = p_condist + s * NCON_MAX;
     int* ncon = p_ncon + s;
@@ -470,10 +481,10 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                                             rowstash, rpos, D, R, aref, cJ, cdof);
         k6_wsinit<<<blocks, tpb, 0, st>>>(n, qM, qfs, qas, ws, nefc, rowtype, rowdof,
                                           rowsign, D, R, aref, cJ, qaccF, Ma, jaref,
-                                          force, state, qfc, scal);
+                                          force, state, qfc, scal, hvalid);
         for (int it = 0; it < SOL_ITER; it++) {
             k7_hessian<<<blocks, tpb, 0, st>>>(n, qM, nefc, rowtype, rowdof, D,
-                                               state, cJ, scal, H);
+                                               state, cJ, scal, H, hvalid);
             k8_solvesearch<<<blocks, tpb, 0, st>>>(n, qM, qfs, Ma, qfc, H, nefc,
                                                    rowtype, rowdof, rowsign, cJ,
                                                    search, Mv, jv, scal);
@@ -482,7 +493,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
             k10_update<<<blocks, tpb, 0, st>>>(n, qfs, qas, nefc, rowtype, rowdof,
                                                rowsign, D, R, cJ, search, Mv, jv,
                                                qaccF, Ma, jaref, force, state, qfc,
-                                               scal);
+                                               scal, hvalid);
         }
         k4_euler<<<blocks, tpb, 0, st>>>(n, qpos, qvel, qaccF);
         CUDA_CHECK(cudaMemcpyAsync(ws, qaccF, (size_t)n * S_NV * 4,

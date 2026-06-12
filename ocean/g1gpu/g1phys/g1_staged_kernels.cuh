@@ -4,7 +4,12 @@
 // Requires (before include): CUDA_CHECK, g1_step.cuh, g1_full_step.cuh.
 #pragma once
 
+#define G1_TRI (G1_NV * (G1_NV + 1) / 2)
+__device__ __forceinline__ int tridx(int i, int j) { return i * (i + 1) / 2 + j; }
+
+#ifndef SWARPS
 #define SWARPS 8                   // warps (envs) per stage-kernel block
+#endif
 
 // SoA strides
 #define S_NQ G1_NQ
@@ -436,8 +441,9 @@ __device__ __forceinline__ float row_dot_g(int rt, int rd, float rs,
 __device__ float constraint_update_g(int nefc, const int* rt, const int* rd,
                                      const float* D, const float* R,
                                      const float* jar, float* force, int* state,
-                                     int lane) {
+                                     int lane, int* out_changed = nullptr) {
     float cost = 0.0f;
+    int ch = 0;
     for (int r = lane; r < nefc; r += 32) {
         float f = -D[r] * jar[r];
         int st = ST_QUAD;
@@ -451,9 +457,11 @@ __device__ float constraint_update_g(int nefc, const int* rt, const int* rd,
             else cost += 0.5f * D[r] * jar[r] * jar[r];
         }
         force[r] = f;
+        if (out_changed) ch |= (state[r] != st);
         state[r] = st;
     }
     for (int o = 16; o > 0; o >>= 1) cost += __shfl_xor_sync(0xffffffff, cost, o);
+    if (out_changed) *out_changed = __any_sync(0xffffffff, ch);
     return cost;
 }
 
@@ -752,7 +760,8 @@ __global__ void k6_wsinit(int n, const float* __restrict__ g_qM,
                           float* __restrict__ g_qacc, float* __restrict__ g_Ma,
                           float* __restrict__ g_jaref, float* __restrict__ g_force,
                           int* __restrict__ g_state, float* __restrict__ g_qfc,
-                          float* __restrict__ g_scal) {
+                          float* __restrict__ g_scal,
+                          int* __restrict__ g_hvalid) {
     __shared__ float s_qacc[SWARPS][G1_NV];
     __shared__ float s_Ma[SWARPS][G1_NV];
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -835,6 +844,7 @@ __global__ void k6_wsinit(int n, const float* __restrict__ g_qM,
         scal[SC_COST] = cost + gauss;
         scal[SC_GAUSS] = gauss;
         scal[SC_DONE] = 0.0f;
+        if (g_hvalid) g_hvalid[e] = 0;  // new substep -> H stale (null = memo off)
     }
 }
 
@@ -849,12 +859,19 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
                            const int* __restrict__ g_state,
                            const float* __restrict__ g_cJ,
                            const float* __restrict__ g_scal,
-                           float* __restrict__ g_H) {
-    __shared__ float s_H[SWARPS][G1_NV * G1_NV];
+                           float* __restrict__ g_H,
+                           int* __restrict__ g_hvalid) {
+    __shared__ float s_H[SWARPS][G1_TRI];
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
     if (g_scal[(size_t)e * NSCAL + SC_DONE] != 0.0f) return;
+    // H depends ONLY on the constraint active-set pattern (M, J, D fixed
+    // within a substep). If no row changed state since the last build, the
+    // factored H in global memory is bit-identical -> skip rebuild+factor.
+    // g_hvalid == nullptr disables memoization (large batches: the active-set
+    // read-back in k10 costs more than the skipped rebuilds save).
+    if (g_hvalid && g_hvalid[e]) return;
     float* H = s_H[warp];
     const int nv = G1_NV;
     const float* qM = g_qM + (size_t)e * G1_NM;
@@ -865,21 +882,18 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     const int* state = g_state + (size_t)e * NEFC_MAX;
     const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
 
-    for (int k = lane; k < nv * nv; k += 32) H[k] = 0.0f;
+    for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
     __syncwarp();
     for (int i = lane; i < nv; i += 32) {
         int adr = g1c_dof_Madr[i];
-        H[i * nv + i] = qM[adr++];
-        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j]) {
-            float v = qM[adr++];
-            H[i * nv + j] = v;
-            H[j * nv + i] = v;
-        }
+        H[tridx(i, i)] = qM[adr++];
+        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+            H[tridx(i, j)] = qM[adr++];
     }
     __syncwarp();
     for (int r = lane; r < nefc; r += 32) {
         if (state[r] != ST_QUAD || rt[r] == ROW_CONTACT) continue;
-        atomicAdd(&H[rd[r] * nv + rd[r]], D[r]);
+        atomicAdd(&H[tridx(rd[r], rd[r])], D[r]);
     }
     __syncwarp();
     for (int r = 0; r < nefc; r++) {
@@ -890,24 +904,25 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
             float Ji = J[i];
             if (Ji == 0.0f) continue;
             float DJi = Dr * Ji;
-            for (int j = 0; j < nv; j++) H[i * nv + j] += DJi * J[j];
+            for (int j = 0; j <= i; j++) H[tridx(i, j)] += DJi * J[j];
         }
     }
     __syncwarp();
     for (int k = 0; k < nv; k++) {
-        if (lane == 0) H[k * nv + k] = sqrtf(H[k * nv + k]);
+        if (lane == 0) H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
         __syncwarp();
-        float invd = 1.0f / H[k * nv + k];
-        for (int i = k + 1 + lane; i < nv; i += 32) H[i * nv + k] *= invd;
+        float invd = 1.0f / H[tridx(k, k)];
+        for (int i = k + 1 + lane; i < nv; i += 32) H[tridx(i, k)] *= invd;
         __syncwarp();
         for (int i = k + 1 + lane; i < nv; i += 32) {
-            float Lik = H[i * nv + k];
-            for (int j = k + 1; j <= i; j++) H[i * nv + j] -= Lik * H[j * nv + k];
+            float Lik = H[tridx(i, k)];
+            for (int j = k + 1; j <= i; j++) H[tridx(i, j)] -= Lik * H[tridx(j, k)];
         }
         __syncwarp();
     }
-    for (int k = lane; k < nv * nv; k += 32)
-        g_H[(size_t)e * (size_t)(nv * nv) + k] = H[k];
+    for (int k = lane; k < G1_TRI; k += 32)
+        g_H[(size_t)e * (size_t)G1_TRI + k] = H[k];
+    if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +940,7 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
                                const float* __restrict__ g_cJ,
                                float* __restrict__ g_search, float* __restrict__ g_Mv,
                                float* __restrict__ g_jv, float* __restrict__ g_scal) {
-    __shared__ float s_L[SWARPS][G1_NV * G1_NV];
+    __shared__ float s_L[SWARPS][G1_TRI];
     __shared__ float s_x[SWARPS][G1_NV];
     __shared__ float s_srch[SWARPS][G1_NV];
     __shared__ float s_Mv[SWARPS][G1_NV];
@@ -940,25 +955,25 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
     float* Mv = s_Mv[warp];
     const int nv = G1_NV;
 
-    for (int k = lane; k < nv * nv; k += 32)
-        L[k] = g_H[(size_t)e * (size_t)(nv * nv) + k];
+    for (int k = lane; k < G1_TRI; k += 32)
+        L[k] = g_H[(size_t)e * (size_t)G1_TRI + k];
     for (int i = lane; i < nv; i += 32)
         x[i] = g_Ma[(size_t)e * nv + i] - g_qfs[(size_t)e * nv + i]
              - g_qfc[(size_t)e * nv + i];
     __syncwarp();
     // x <- (L L')^-1 x, column sweeps
     for (int j = 0; j < nv; j++) {
-        if (lane == 0) x[j] /= L[j * nv + j];
+        if (lane == 0) x[j] /= L[tridx(j, j)];
         __syncwarp();
         float xj = x[j];
-        for (int i = j + 1 + lane; i < nv; i += 32) x[i] -= L[i * nv + j] * xj;
+        for (int i = j + 1 + lane; i < nv; i += 32) x[i] -= L[tridx(i, j)] * xj;
         __syncwarp();
     }
     for (int j = nv - 1; j >= 0; j--) {
-        if (lane == 0) x[j] /= L[j * nv + j];
+        if (lane == 0) x[j] /= L[tridx(j, j)];
         __syncwarp();
         float xj = x[j];
-        for (int i = lane; i < j; i += 32) x[i] -= L[j * nv + i] * xj;
+        for (int i = lane; i < j; i += 32) x[i] -= L[tridx(j, i)] * xj;
         __syncwarp();
     }
     for (int i = lane; i < nv; i += 32) srch[i] = -x[i];
@@ -1168,7 +1183,8 @@ __global__ void k10_update(int n, const float* __restrict__ g_qfs,
                            float* __restrict__ g_qacc, float* __restrict__ g_Ma,
                            float* __restrict__ g_jaref, float* __restrict__ g_force,
                            int* __restrict__ g_state, float* __restrict__ g_qfc,
-                           float* __restrict__ g_scal) {
+                           float* __restrict__ g_scal,
+                           int* __restrict__ g_hvalid) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
@@ -1189,12 +1205,14 @@ __global__ void k10_update(int n, const float* __restrict__ g_qfs,
     const int* rd = g_rowdof + (size_t)e * NEFC_MAX;
     const float* rs = g_rowsign + (size_t)e * NEFC_MAX;
     const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
+    int hch = 0;
     float cost = constraint_update_g(nefc, rt, rd,
                                      g_D + (size_t)e * NEFC_MAX,
                                      g_R + (size_t)e * NEFC_MAX,
                                      g_jaref + (size_t)e * NEFC_MAX,
                                      g_force + (size_t)e * NEFC_MAX,
-                                     g_state + (size_t)e * NEFC_MAX, lane);
+                                     g_state + (size_t)e * NEFC_MAX, lane,
+                                     g_hvalid ? &hch : nullptr);
     jt_force_g(nefc, rt, rd, rs, cJ, g_force + (size_t)e * NEFC_MAX,
                g_qfc + (size_t)e * nv, lane);
     float gauss = 0.0f, gn = 0.0f;
@@ -1217,6 +1235,7 @@ __global__ void k10_update(int n, const float* __restrict__ g_qfs,
         scal[SC_COST] = newcost;
         scal[SC_GAUSS] = gauss;
         if (improvement < SOL_TOL || gradient < SOL_TOL) scal[SC_DONE] = 1.0f;
+        if (g_hvalid && hch) g_hvalid[e] = 0;  // active set flipped -> H stale
     }
 }
 
