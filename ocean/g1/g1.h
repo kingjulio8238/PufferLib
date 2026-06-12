@@ -32,14 +32,22 @@
 
 #define G1_NUM_JOINTS 29
 #define G1_OBS_SIZE 96
-#define G1_DECIMATION 10
+#ifndef G1_DECIMATION
+#define G1_DECIMATION 10          // -DG1_DECIMATION=5 for task v2 (dt 0.004)
+#endif
 #define G1_CTRL_DT 0.02f
 
 // Frozen wall spec (docs/baselines.md) — guarded at model load.
-#define G1_WALL_TIMESTEP 0.002
+#ifndef G1_WALL_TIMESTEP
+#define G1_WALL_TIMESTEP 0.002    // -DG1_WALL_TIMESTEP=0.004 for task v2
+#endif
 #define G1_WALL_SOLVER mjSOL_NEWTON
+#ifndef G1_WALL_ITERATIONS
 #define G1_WALL_ITERATIONS 3
+#endif
+#ifndef G1_WALL_LS_ITERATIONS
 #define G1_WALL_LS_ITERATIONS 5
+#endif
 #define G1_WALL_CONE mjCONE_PYRAMIDAL
 
 typedef struct {
@@ -111,6 +119,12 @@ static void g1_load_model(void) {
         fprintf(stderr, "g1: FAILED to load g1.mjb (set G1_MODEL_PATH)\n");
         exit(1);
     }
+
+    // Task v2: the mjb bakes the v1 wall settings; apply this build's
+    // settings, then re-assert (the guard below stays meaningful).
+    g1_model->opt.timestep = G1_WALL_TIMESTEP;
+    g1_model->opt.iterations = G1_WALL_ITERATIONS;
+    g1_model->opt.ls_iterations = G1_WALL_LS_ITERATIONS;
 
     // Physics-parity guard: this env must run the EXACT wall physics.
     if (g1_model->opt.timestep != G1_WALL_TIMESTEP ||
