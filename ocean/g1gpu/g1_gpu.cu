@@ -37,7 +37,9 @@
 #include "g1phys/g1_staged_kernels.cuh"
 #include "g1phys/g1_solver_consts.cuh"
 
+#ifndef ENV_DECIMATION
 #define ENV_DECIMATION 10
+#endif
 #define ENV_CTRL_DT 0.02f
 #define ENV_RESET_NOISE 0.05f
 #define ENV_TERM_HEIGHT 0.35f

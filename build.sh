@@ -311,7 +311,9 @@ ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 # add to the env static lib. GPU builds only.
 if [ -z "$MODE" ] && ls "$SRC_DIR"/*_gpu.cu >/dev/null 2>&1; then
     echo "Compiling CUDA env sources for $ENV..."
-    $NVCC -c -O3 -arch=$ARCH -Xcompiler -fPIC -std=c++17 \
+    # G1_TASK_FLAGS: task-physics defines (e.g. v2s:
+    # -DG1_DT=0.004f -DENV_DECIMATION=5 -DSOL_ITER=2 -DSOL_LS_ITER=3)
+    $NVCC -c -O3 -arch=$ARCH $G1_TASK_FLAGS -Xcompiler -fPIC -std=c++17 \
         -I. -Isrc -I"$SRC_DIR" -I$CUDA_HOME/include \
         "$SRC_DIR"/*_gpu.cu -o "build/${ENV}_gpu.o"
     ar rcs "$STATIC_LIB" "$STATIC_OBJ" "build/${ENV}_gpu.o"
