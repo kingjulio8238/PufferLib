@@ -307,6 +307,16 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
+# Optional CUDA env sources (GPU-native envs, e.g. g1gpu): nvcc-compile and
+# add to the env static lib. GPU builds only.
+if [ -z "$MODE" ] && ls "$SRC_DIR"/*_gpu.cu >/dev/null 2>&1; then
+    echo "Compiling CUDA env sources for $ENV..."
+    $NVCC -c -O3 -arch=$ARCH -Xcompiler -fPIC -std=c++17 \
+        -I. -Isrc -I"$SRC_DIR" -I$CUDA_HOME/include \
+        "$SRC_DIR"/*_gpu.cu -o "build/${ENV}_gpu.o"
+    ar rcs "$STATIC_LIB" "$STATIC_OBJ" "build/${ENV}_gpu.o"
+fi
+
 # Brittle hack: have to extract the tensor type from the static lib to build trainer
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")
 if [ -z "$OBS_TENSOR_T" ]; then

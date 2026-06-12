@@ -207,6 +207,17 @@ extern const char* cudaGetErrorString(cudaError_t);
 
 // Forward declare env-provided functions (defined in binding.c after this include)
 void my_init(Env* env, Dict* kwargs);
+
+#ifdef MY_GPU_NATIVE
+// GPU-native env hooks (env steps entirely on device; see ocean/g1gpu)
+void my_gpu_init(int total_agents, unsigned int seed);
+void my_gpu_reset(void* gpu_observations);
+void my_gpu_step_range(void* stream, int agent_start, int count,
+                       const float* gpu_actions, void* gpu_obs,
+                       float* gpu_rewards, float* gpu_terminals);
+float my_gpu_log_into(void* log_out);  // fills Log SUMS, returns n episodes
+void my_gpu_close(void);
+#endif
 void my_log(Log* log, Dict* out);
 
 #ifdef MY_USES_PERM
@@ -276,25 +287,33 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             net_callback(ctx, buf, t);
 
+            cudaStreamSynchronize(stream);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+#ifdef MY_GPU_NATIVE
+            // envs live on the GPU: step the buffer's agent range in place
+            // (no D2H/H2D, no host memsets — K_epi writes every entry)
+            my_gpu_step_range(stream, agent_start, agents_per_buffer,
+                &vec->gpu_actions[agent_start * NUM_ATNS],
+                (char*)vec->gpu_observations + (size_t)agent_start * OBS_SIZE * obs_element_size(),
+                &vec->gpu_rewards[agent_start],
+                &vec->gpu_terminals[agent_start]);
+            cudaStreamSynchronize(stream);
+#else
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
                 &vec->gpu_actions[agent_start * NUM_ATNS],
                 agents_per_buffer * NUM_ATNS * sizeof(float),
                 cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
-
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
-            clock_gettime(CLOCK_MONOTONIC, &t0);
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
             }
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
-
             cudaMemcpyAsync(
                 (char*)vec->gpu_observations + agent_start * OBS_SIZE * obs_element_size(),
                 (char*)vec->observations + agent_start * OBS_SIZE * obs_element_size(),
@@ -310,6 +329,9 @@ static void* static_omp_threadmanager(void* arg) {
                 &vec->terminals[agent_start],
                 agents_per_buffer * sizeof(float),
                 cudaMemcpyHostToDevice, stream);
+#endif
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 #ifdef MY_ACTION_MASK
             cudaMemcpyAsync(
                 vec->gpu_action_mask + agent_start * MY_ACTION_MASK,
@@ -433,6 +455,9 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         cudaMemset(vec->gpu_actions, 0, total_agents * NUM_ATNS * sizeof(float));
         cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
+#ifdef MY_GPU_NATIVE
+        my_gpu_init(total_agents, 12345u);
+#endif
     } else {
         vec->observations = calloc(total_agents * OBS_SIZE, obs_elem_size);
         vec->actions = (float*)calloc(total_agents * NUM_ATNS, sizeof(float));
@@ -562,6 +587,15 @@ int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
 #endif
 
 void static_vec_reset(StaticVec* vec) {
+#ifdef MY_GPU_NATIVE
+    if (vec->gpu) {
+        my_gpu_reset(vec->gpu_observations);
+        cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
+        cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
+        cudaDeviceSynchronize();
+        return;
+    }
+#endif
     Env* envs = (Env*)vec->envs;
     for (int i = 0; i < vec->size; i++) {
         c_reset(&envs[i]);
@@ -663,6 +697,14 @@ void static_vec_close(StaticVec* vec) {
 }
 
 static inline float static_vec_aggregate_logs(StaticVec* vec, Log* out) {
+#ifdef MY_GPU_NATIVE
+    memset(out, 0, sizeof(Log));
+    float n_eps = my_gpu_log_into(out);
+    if (n_eps == 0.0f) return 0;
+    int nk = sizeof(Log) / sizeof(float);
+    for (int j = 0; j < nk; j++) ((float*)out)[j] /= n_eps;
+    return n_eps;
+#endif
     Env* envs = (Env*)vec->envs;
     memset(out, 0, sizeof(Log));
     int num_keys = sizeof(Log) / sizeof(float);
