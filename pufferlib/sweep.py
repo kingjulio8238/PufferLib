@@ -150,7 +150,8 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
                     'match_enemy_model_path'):
             continue
 
-        assert isinstance(param, dict), f'Param {name} is not a dict'
+        if not isinstance(param, dict):
+            continue  # scalar [sweep] keys are launcher settings, not search spaces
         if any(isinstance(param[k], dict) for k in param):
             param_spaces[name] = _params_from_puffer_sweep(param, only_include)
             continue
