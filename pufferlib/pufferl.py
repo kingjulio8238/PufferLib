@@ -224,6 +224,13 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
+    # Warm-start: train continues from a checkpoint (eval/match already honor
+    # load_model_path; train silently ignored it)
+    warm_path = args.get('load_model_path')
+    if warm_path and warm_path != 'latest':
+        backend.load_weights(pufferl, warm_path)
+        print(f'Warm-start: loaded weights from {warm_path}')
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
