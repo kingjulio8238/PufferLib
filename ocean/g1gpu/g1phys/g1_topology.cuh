@@ -12,7 +12,9 @@
 #define G1_MAX_LEVEL_WIDTH 4
 #define G1_MAX_CHAIN 15
 #define G1_NM 341                    // sparse inertia size (legacy dof_Madr layout)
+#ifndef G1_DT
 #define G1_DT 0.002f
+#endif
 #define G1_GRAVITY_Z (-9.81f)
 
 

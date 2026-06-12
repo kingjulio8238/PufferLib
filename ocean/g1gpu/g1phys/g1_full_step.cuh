@@ -12,8 +12,12 @@
 #define NEFC_MAX 96       // 29 friction + 29 limits + contact rows
 
 // solver options (the wall; mirrored from the mjb in gen, hardcoded here)
+#ifndef SOL_ITER
 #define SOL_ITER 3
+#endif
+#ifndef SOL_LS_ITER
 #define SOL_LS_ITER 5
+#endif
 #define SOL_TOL 1e-8f
 #define SOL_LS_TOL 0.01f
 #define SOL_IMPRATIO 1.0f
