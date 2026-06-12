@@ -140,20 +140,18 @@ __global__ void k2_crb_factor(int n, const float* __restrict__ g_cinert,
                               const float* __restrict__ g_cdof,
                               float* __restrict__ g_qM, float* __restrict__ g_qLD,
                               float* __restrict__ g_qLDiagInv) {
+    // smem diet: qM streams to global as computed (factor happens in qLD);
+    // cdof is read-only -> served from L2. 4.8KB -> 2.6KB per env.
     __shared__ float s_crb[SWARPS][S_CI];
-    __shared__ float s_cdof[SWARPS][S_CD];
-    __shared__ float s_qM[SWARPS][G1_NM];
     __shared__ float s_qLD[SWARPS][G1_NM];
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
     float* crb = s_crb[warp];
-    float* cdof = s_cdof[warp];
-    float* qM = s_qM[warp];
+    const float* cdof = g_cdof + (size_t)e * S_CD;
     float* qLD = s_qLD[warp];
 
     for (int k = lane; k < S_CI; k += 32) crb[k] = g_cinert[(size_t)e * S_CI + k];
-    for (int k = lane; k < S_CD; k += 32) cdof[k] = g_cdof[(size_t)e * S_CD + k];
     __syncwarp();
     if (lane < 10) {
         for (int i = G1_NBODY - 1; i >= 1; i--) {
@@ -162,18 +160,20 @@ __global__ void k2_crb_factor(int n, const float* __restrict__ g_cinert,
         }
     }
     __syncwarp();
+    float* gqM = g_qM + (size_t)e * G1_NM;
     for (int i = lane; i < G1_NV; i += 32) {
         float buf[6];
         mul_inert_vec(buf, crb + 10 * g1c_dof_bodyid[i], cdof + 6 * i);
         int adr = g1c_dof_Madr[i];
-        qM[adr++] = g1c_dof_armature[i] + dot6(cdof + 6 * i, buf);
-        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
-            qM[adr++] = dot6(cdof + 6 * j, buf);
+        float v = g1c_dof_armature[i] + dot6(cdof + 6 * i, buf);
+        qLD[adr] = v; gqM[adr] = v; adr++;
+        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j]) {
+            v = dot6(cdof + 6 * j, buf);
+            qLD[adr] = v; gqM[adr] = v; adr++;
+        }
     }
     __syncwarp();
     // LDL^T factor (mj_factorI_legacy; k serial, ancestors lane-parallel)
-    for (int k = lane; k < G1_NM; k += 32) qLD[k] = qM[k];
-    __syncwarp();
     for (int k = G1_NV - 1; k >= 0; k--) {
         int Madr_kk = g1c_dof_Madr[k];
         int nanc = (k < G1_NV - 1 ? g1c_dof_Madr[k + 1] : G1_NM) - Madr_kk - 1;
@@ -190,10 +190,8 @@ __global__ void k2_crb_factor(int n, const float* __restrict__ g_cinert,
         if (i >= 0) qLD[Madr_kk + 1 + lane] = tmp;
         __syncwarp();
     }
-    for (int k = lane; k < G1_NM; k += 32) {
-        g_qM[(size_t)e * G1_NM + k] = qM[k];
+    for (int k = lane; k < G1_NM; k += 32)
         g_qLD[(size_t)e * G1_NM + k] = qLD[k];
-    }
     for (int i = lane; i < G1_NV; i += 32)
         g_qLDiagInv[(size_t)e * G1_NV + i] = 1.0f / qLD[g1c_dof_Madr[i]];
 }
@@ -214,15 +212,13 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
                                  float* __restrict__ g_qfrc_smooth,
                                  float* __restrict__ g_qacc_smooth,
                                  float* __restrict__ g_act_force) {
+    // smem diet: qLD/diag (lane-0 serial solve) and qpos (one actuation read)
+    // served from L2; bias folded into smooth. 5.4KB -> 3.5KB per env.
     __shared__ float s_cdof[SWARPS][S_CD];
     __shared__ float s_cvel[SWARPS][G1_NBODY * 6];
     __shared__ float s_cacc[SWARPS][G1_NBODY * 6];
     __shared__ float s_cdd[SWARPS][S_CD];
-    __shared__ float s_qLD[SWARPS][G1_NM];
-    __shared__ float s_diag[SWARPS][G1_NV];
     __shared__ float s_qvel[SWARPS][G1_NV];
-    __shared__ float s_qpos[SWARPS][S_NQ];
-    __shared__ float s_bias[SWARPS][G1_NV];
     __shared__ float s_smooth[SWARPS][G1_NV];
     __shared__ float s_qacc[SWARPS][G1_NV];
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -232,21 +228,16 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     float* cvel = s_cvel[warp];
     float* cacc = s_cacc[warp];
     float* cdd = s_cdd[warp];
-    float* qLD = s_qLD[warp];
-    float* diag = s_diag[warp];
+    const float* qLD = g_qLD + (size_t)e * G1_NM;
+    const float* diag = g_qLDiagInv + (size_t)e * G1_NV;
     float* qvel = s_qvel[warp];
-    float* qpos = s_qpos[warp];
-    float* bias = s_bias[warp];
+    const float* qpos = g_qpos + (size_t)e * S_NQ;
     float* smoo = s_smooth[warp];
     float* qacc = s_qacc[warp];
 
     for (int k = lane; k < S_CD; k += 32) cdof[k] = g_cdof[(size_t)e * S_CD + k];
-    for (int k = lane; k < G1_NM; k += 32) qLD[k] = g_qLD[(size_t)e * G1_NM + k];
-    for (int k = lane; k < G1_NV; k += 32) {
-        diag[k] = g_qLDiagInv[(size_t)e * G1_NV + k];
+    for (int k = lane; k < G1_NV; k += 32)
         qvel[k] = g_qvel[(size_t)e * G1_NV + k];
-    }
-    for (int k = lane; k < S_NQ; k += 32) qpos[k] = g_qpos[(size_t)e * S_NQ + k];
     if (lane == 0) for (int k = 0; k < 6; k++) cvel[k] = 0.0f;
     __syncwarp();
 
@@ -317,13 +308,11 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
         }
     }
     __syncwarp();
-    for (int i = lane; i < G1_NV; i += 32)
-        bias[i] = dot6(cdof + 6 * i, cvel + 6 * g1c_dof_bodyid[i]);
-    __syncwarp();
-
-    // passive + bias fusion + PD actuation
-    for (int i = lane; i < G1_NV; i += 32)
-        smoo[i] = -g1c_dof_damping[i] * qvel[i] - bias[i];
+    // passive + bias fusion + PD actuation (bias folded; identical op order)
+    for (int i = lane; i < G1_NV; i += 32) {
+        float b = dot6(cdof + 6 * i, cvel + 6 * g1c_dof_bodyid[i]);
+        smoo[i] = -g1c_dof_damping[i] * qvel[i] - b;
+    }
     __syncwarp();
     if (lane < G1_NU) {
         int a = lane;
