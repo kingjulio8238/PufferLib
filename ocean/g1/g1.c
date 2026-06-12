@@ -182,6 +182,10 @@ int main(int argc, char** argv) {
         r->env.terminals = &r->term;
         r->env.rng = (unsigned int)(i + 1);
         g1_set_default_config(&r->env);
+        // checkpoints are tied to the action_scale they trained with
+        // (task v1.2 = 0.25); override via G1_ACTION_SCALE
+        const char* as = getenv("G1_ACTION_SCALE");
+        r->env.action_scale = as ? (float)atof(as) : 0.25f;
         g1_init(&r->env);
         c_reset(&r->env);
     }
