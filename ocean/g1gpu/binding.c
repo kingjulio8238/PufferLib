@@ -26,7 +26,13 @@ typedef struct {
     float* rewards;
     float* terminals;
     int num_agents;
+    unsigned int rng;   /* unused (RNG lives on device); vecenv default init sets it */
 } G1Gpu;
+
+/* prototypes required by vecenv.h (definitions below; never invoked under
+ * MY_GPU_NATIVE) */
+struct G1Gpu_fwd;
+
 
 #define Env G1Gpu
 #define OBS_SIZE 96
@@ -35,6 +41,11 @@ typedef struct {
                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 #define OBS_TENSOR_T FloatTensor
 #define MY_GPU_NATIVE 1
+
+void c_reset(G1Gpu* env);
+void c_step(G1Gpu* env);
+void c_close(G1Gpu* env);
+void c_render(G1Gpu* env);
 
 #include "vecenv.h"
 
