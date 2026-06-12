@@ -31,7 +31,24 @@
 #include <mujoco/mujoco.h>
 
 #define G1_NUM_JOINTS 29
+#ifdef G1_TASK_V3
+#define G1_OBS_SIZE 98
+// --- task v3 gait-shaping constants (KEEP IN SYNC: g1.h / stagedenv.cu /
+// g1_gpu.cu) — from unitree_rl_gym's proven G1 recipe ---
+#define G1_V3_PERIOD 40
+#define G1_V3_STANCE 0.55f
+#define G1_V3_W_CONTACT 0.18f
+#define G1_V3_W_SWING (-20.0f)
+#define G1_V3_W_HIP (-1.0f)
+#define G1_V3_FOOT_Z0 0.08f
+#define G1_V3_LFOOT_BODY 7
+#define G1_V3_RFOOT_BODY 13
+#define G1_V3_LFOOT_GEOM 17
+#define G1_V3_RFOOT_GEOM 31
+#define G1_V3_NUM_ACT 12
+#else
 #define G1_OBS_SIZE 96
+#endif
 #ifndef G1_DECIMATION
 #define G1_DECIMATION 10          // -DG1_DECIMATION=5 for task v2 (dt 0.004)
 #endif
@@ -237,6 +254,13 @@ void compute_observations(G1* env) {
         obs[38 + j] = 0.05f * (float)d->qvel[6 + j];
         obs[67 + j] = env->prev_action[j];
     }
+#ifdef G1_TASK_V3
+    {
+        float phi = (float)(env->tick % G1_V3_PERIOD) / (float)G1_V3_PERIOD;
+        obs[96] = sinf(6.2831853f * phi);
+        obs[97] = cosf(6.2831853f * phi);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +301,9 @@ void c_step(G1* env) {
     float a[G1_NUM_JOINTS];
     for (int j = 0; j < G1_NUM_JOINTS; j++) {
         a[j] = g1_clampf(env->actions[j], -1.0f, 1.0f);
+#ifdef G1_TASK_V3
+        if (j >= G1_V3_NUM_ACT) a[j] = 0.0f;   // legs-only actions
+#endif
         mjtNum target = g1_default_ctrl[j] + (mjtNum)(env->action_scale * a[j]);
         mjtNum lo = g1_model->actuator_ctrlrange[2 * j];
         mjtNum hi = g1_model->actuator_ctrlrange[2 * j + 1];
@@ -320,6 +347,39 @@ void c_step(G1* env) {
             + env->w_orientation * (float)(pg[0] * pg[0] + pg[1] * pg[1])
             + env->w_torque * torque2
             + env->w_action_rate * act_rate2;
+#ifdef G1_TASK_V3
+    {
+        // foot contacts (active = dist < 0) from the last substep's mj_step
+        int fc[2] = {0, 0};
+        for (int c = 0; c < d->ncon; c++) {
+            if (d->contact[c].dist < 0) {
+                int ga = d->contact[c].geom[0], gb = d->contact[c].geom[1];
+                if (ga == G1_V3_LFOOT_GEOM || gb == G1_V3_LFOOT_GEOM) fc[0] = 1;
+                if (ga == G1_V3_RFOOT_GEOM || gb == G1_V3_RFOOT_GEOM) fc[1] = 1;
+            }
+        }
+        float phi = (float)(env->tick % G1_V3_PERIOD) / (float)G1_V3_PERIOD;
+        float lp[2];
+        lp[0] = phi;
+        lp[1] = phi + 0.5f >= 1.0f ? phi - 0.5f : phi + 0.5f;
+        const int fbody[2] = {G1_V3_LFOOT_BODY, G1_V3_RFOOT_BODY};
+        for (int f = 0; f < 2; f++) {
+            int stance = lp[f] < G1_V3_STANCE;
+            r += G1_V3_W_CONTACT * ((stance == fc[f]) ? 1.0f : 0.0f);
+            if (!fc[f]) {
+                float dz = (float)d->xpos[3 * fbody[f] + 2] - G1_V3_FOOT_Z0;
+                r += G1_V3_W_SWING * dz * dz;
+            }
+        }
+        float hp = 0.0f;
+        const int hdof[4] = {1, 2, 7, 8};
+        for (int h = 0; h < 4; h++) {
+            float dq = (float)(d->qpos[7 + hdof[h]]) - (float)g1_default_qpos[hdof[h]];
+            hp += dq * dq;
+        }
+        r += G1_V3_W_HIP * hp;
+    }
+#endif
     float reward = r * G1_CTRL_DT;
 
     env->rewards[0] = reward;

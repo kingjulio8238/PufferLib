@@ -297,7 +297,7 @@ if [ ! -f "$BINDING_SRC" ]; then
 fi
 
 echo "Compiling static library for $ENV..."
-${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
+${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS $G1_TASK_FLAGS \
     -I. -Isrc -I$SRC_DIR -Ivendor \
     "${INCLUDES[@]}" \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \

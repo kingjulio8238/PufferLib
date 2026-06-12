@@ -35,7 +35,11 @@ struct G1Gpu_fwd;
 
 
 #define Env G1Gpu
+#ifdef G1_TASK_V3
+#define OBS_SIZE 98
+#else
 #define OBS_SIZE 96
+#endif
 #define NUM_ATNS 29
 #define ACT_SIZES {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, \
                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}

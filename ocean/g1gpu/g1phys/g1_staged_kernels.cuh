@@ -487,7 +487,8 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                             float* __restrict__ g_rpos, float* __restrict__ g_D,
                             float* __restrict__ g_R, float* __restrict__ g_aref,
                             float* __restrict__ g_cJ,
-                            const float* __restrict__ g_cdof) {
+                            const float* __restrict__ g_cdof,
+                            float* __restrict__ g_footc) {  // per-env {L,R} foot contact flags
     __shared__ float s_xpos[SWARPS][S_X3];
     __shared__ float s_xquat[SWARPS][S_X4];
     __shared__ float s_qpos[SWARPS][S_NQ];
@@ -538,6 +539,20 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
             nc += c2;
         }
         cnt[0] = nc;
+        // foot-contact flags for gait-shaping rewards (active = dist < 0;
+        // geom 17 = left_foot box, 31 = right_foot box — model recon)
+        {
+            float lf = 0.0f, rf = 0.0f;
+            for (int c = 0; c < nc; c++) {
+                if (cdist[c] < 0.0f) {
+                    int gg = g1c_pair_geom2[cpair[c]];
+                    if (gg == 17) lf = 1.0f;
+                    else if (gg == 31) rf = 1.0f;
+                }
+            }
+            g_footc[2 * e + 0] = lf;
+            g_footc[2 * e + 1] = rf;
+        }
         // friction + limit rows
         int r = 0;
         for (int i = 0; i < G1_NV; i++) {

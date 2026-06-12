@@ -45,7 +45,22 @@
 #define ENV_TERM_HEIGHT 0.35f
 #define ENV_TERM_GRAVITY_Z (-0.6f)
 #define ENV_CMD_RESAMPLE 500
+#ifdef G1_TASK_V3
+#define ENV_OBS 98
+// --- task v3 gait-shaping constants (KEEP IN SYNC: g1.h / stagedenv.cu /
+// g1_gpu.cu) — from unitree_rl_gym's proven G1 recipe ---
+#define G1_V3_PERIOD 40
+#define G1_V3_STANCE 0.55f
+#define G1_V3_W_CONTACT 0.18f
+#define G1_V3_W_SWING (-20.0f)
+#define G1_V3_W_HIP (-1.0f)
+#define G1_V3_FOOT_Z0 0.08f
+#define G1_V3_LFOOT_BODY 7
+#define G1_V3_RFOOT_BODY 13
+#define G1_V3_NUM_ACT 12
+#else
 #define ENV_OBS 96
+#endif
 
 // runtime-configurable env parameters (the Protein sweep moves these)
 __device__ float g1e_action_scale, g1e_w_track_lin, g1e_w_track_ang;
@@ -154,7 +169,8 @@ __global__ void k_reset_all(int n, unsigned int seed, unsigned int* g_rng,
 
 // write the 96-float obs of the current state (used post-reset and in K_epi)
 __device__ void write_obs(int e, int lane, const float* g_qpos, const float* g_qvel,
-                          const float* g_prev, const float* g_cmd, float* obs) {
+                          const float* g_prev, const float* g_cmd,
+                          const int* g_tick_obs, float* obs) {
     if (lane == 0) {
         float gw[3] = {0.0f, 0.0f, -1.0f}, gb[3];
         world_to_base(g_qpos + (size_t)e * S_NQ + 3, gw, gb);
@@ -169,15 +185,23 @@ __device__ void write_obs(int e, int lane, const float* g_qpos, const float* g_q
         obs[38 + j] = 0.05f * g_qvel[(size_t)e * S_NV + 6 + j];
         obs[67 + j] = g_prev[(size_t)e * S_NU + j];
     }
+#ifdef G1_TASK_V3
+    if (lane == 0) {
+        float phi = (float)(g_tick_obs[e] % G1_V3_PERIOD) / (float)G1_V3_PERIOD;
+        obs[96] = sinf(6.2831853f * phi);
+        obs[97] = cosf(6.2831853f * phi);
+    }
+#endif
 }
 
 __global__ void k_obs_all(int n, const float* g_qpos, const float* g_qvel,
                           const float* g_prev, const float* g_cmd,
+                          const int* g_tick,
                           float* vec_obs) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
-    write_obs(e, lane, g_qpos, g_qvel, g_prev, g_cmd, vec_obs + (size_t)e * ENV_OBS);
+    write_obs(e, lane, g_qpos, g_qvel, g_prev, g_cmd, g_tick, vec_obs + (size_t)e * ENV_OBS);
 }
 
 // actions (vec gpu_actions) -> clamped a + PD ctrl
@@ -188,6 +212,9 @@ __global__ void k_act(int n, const float* __restrict__ vec_actions,
     if (e >= n) return;
     for (int j = lane; j < S_NU; j += 32) {
         float a = fminf(fmaxf(vec_actions[(size_t)e * S_NU + j], -1.0f), 1.0f);
+#ifdef G1_TASK_V3
+        if (j >= G1_V3_NUM_ACT) a = 0.0f;   // legs-only actions
+#endif
         g_act[(size_t)e * S_NU + j] = a;
         float target = g1c_key_ctrl[j] + g1e_action_scale * a;
         float lo = g1c_act_ctrlrange[2 * j], hi = g1c_act_ctrlrange[2 * j + 1];
@@ -199,6 +226,8 @@ __global__ void k_act(int n, const float* __restrict__ vec_actions,
 __global__ void k_epi(int n,
                       float* __restrict__ g_qpos, float* __restrict__ g_qvel,
                       float* __restrict__ g_ws,
+                      const float* __restrict__ g_xpos,
+                      const float* __restrict__ g_footc,
                       const float* __restrict__ g_af,
                       const float* __restrict__ g_act,
                       float* __restrict__ g_prev, float* __restrict__ g_cmd,
@@ -249,6 +278,33 @@ __global__ void k_epi(int n,
                 + g1e_w_orientation * (pg[0] * pg[0] + pg[1] * pg[1])
                 + g1e_w_torque * t2
                 + g1e_w_action_rate * ar2;
+#ifdef G1_TASK_V3
+        {
+            int tk = g_tick[e];
+            float phi = (float)(tk % G1_V3_PERIOD) / (float)G1_V3_PERIOD;
+            float lp[2];
+            lp[0] = phi;
+            lp[1] = phi + 0.5f >= 1.0f ? phi - 0.5f : phi + 0.5f;
+            const int fbody[2] = {G1_V3_LFOOT_BODY, G1_V3_RFOOT_BODY};
+            for (int f = 0; f < 2; f++) {
+                int stance = lp[f] < G1_V3_STANCE;
+                int contact = g_footc[2 * e + f] > 0.5f;
+                r += G1_V3_W_CONTACT * ((stance == contact) ? 1.0f : 0.0f);
+                if (!contact) {
+                    float dz = g_xpos[(size_t)e * S_X3 + 3 * fbody[f] + 2]
+                             - G1_V3_FOOT_Z0;
+                    r += G1_V3_W_SWING * dz * dz;
+                }
+            }
+            float hp = 0.0f;
+            const int hdof[4] = {1, 2, 7, 8};
+            for (int h = 0; h < 4; h++) {
+                float dq = qpos[7 + hdof[h]] - g1c_key_qpos[7 + hdof[h]];
+                hp += dq * dq;
+            }
+            r += G1_V3_W_HIP * hp;
+        }
+#endif
         float reward = r * ENV_CTRL_DT;
         int fell = (qpos[2] < ENV_TERM_HEIGHT) || (pg[2] > ENV_TERM_GRAVITY_Z) ||
                    !isfinite(qpos[2]);
@@ -292,7 +348,7 @@ __global__ void k_epi(int n,
         g_rng[e] = rng;
     }
     __syncwarp();
-    write_obs(e, lane, g_qpos, g_qvel, g_prev, g_cmd, vec_obs + (size_t)e * ENV_OBS);
+    write_obs(e, lane, g_qpos, g_qvel, g_prev, g_cmd, g_tick, vec_obs + (size_t)e * ENV_OBS);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +365,8 @@ static float *p_qpos, *p_qvel, *p_ctrl, *p_xpos, *p_xquat, *p_com, *p_cinert,
 static float *p_ws, *p_qaccF, *p_Ma, *p_qfc, *p_search, *p_Mv;
 static float *p_jaref, *p_force, *p_jv, *p_rpos, *p_D, *p_R, *p_aref, *p_rowsign;
 static float *p_scal, *p_H, *p_cJ, *p_condist;
-static int* p_hvalid;  // H-memo cache flags; nullptr = memo off (large batch)
+static int* p_hvalid;
+static float* p_footc;  // per-env {L,R} foot contact flags (k5 -> k_epi)  // H-memo cache flags; nullptr = memo off (large batch)
 static int *p_ncon, *p_nefc, *p_rowtype, *p_rowdof, *p_rowstash, *p_state;
 static float *p_act, *p_prev, *p_cmd, *p_eplog;
 static int* p_tick;
@@ -371,6 +428,8 @@ extern "C" void my_gpu_init(int total_agents, unsigned int seed) {
     // H-memoization wins when the cached factors stay L2-resident; above
     // ~16k envs the k10 active-set read-back costs more than skipped
     // rebuilds save (measured on GB202). Both paths bit-exact.
+    CUDA_CHECK(cudaMalloc(&p_footc, (size_t)n * 2 * 4));
+    CUDA_CHECK(cudaMemset(p_footc, 0, (size_t)n * 2 * 4));
     if (n <= 16384) {
         CUDA_CHECK(cudaMalloc(&p_hvalid, (size_t)n * 4));
         CUDA_CHECK(cudaMemset(p_hvalid, 0, (size_t)n * 4));
@@ -408,7 +467,7 @@ extern "C" void my_gpu_reset(void* vec_gpu_obs) {
     k_reset_all<<<blocks, 32 * SWARPS>>>(n, 12345u, p_rng, p_qpos, p_qvel, p_ws,
                                          p_prev, p_cmd, p_tick, p_eplog);
     k_obs_all<<<blocks, 32 * SWARPS>>>(n, p_qpos, p_qvel, p_prev, p_cmd,
-                                       (float*)vec_gpu_obs);
+                                       p_tick, (float*)vec_gpu_obs);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -453,6 +512,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     float* scal = p_scal + s * NSCAL;
     float* H = p_H + (size_t)s * G1_TRI;
     int* hvalid = p_hvalid ? p_hvalid + s : nullptr;
+    float* footc = p_footc + (size_t)s * 2;
     float* cJ = p_cJ + s * NCROW_MAX * S_NV;
     float* condist = p_condist + s * NCON_MAX;
     int* ncon = p_ncon + s;
@@ -480,7 +540,8 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                                                  cdof, qLD, qLDiagInv, qfs, qas, af);
         k5_assemble<<<blocks, tpb, 0, st>>>(n, qpos, qvel, xpos, xquat, com, ncon,
                                             nefc, condist, rowtype, rowdof, rowsign,
-                                            rowstash, rpos, D, R, aref, cJ, cdof);
+                                            rowstash, rpos, D, R, aref, cJ, cdof,
+                                            footc);
         k6_wsinit<<<blocks, tpb, 0, st>>>(n, qM, qfs, qas, ws, nefc, rowtype, rowdof,
                                           rowsign, D, R, aref, cJ, qaccF, Ma, jaref,
                                           force, state, qfc, scal, hvalid);
@@ -501,8 +562,8 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         CUDA_CHECK(cudaMemcpyAsync(ws, qaccF, (size_t)n * S_NV * 4,
                                    cudaMemcpyDeviceToDevice, st));
     }
-    k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, af, act, prev, cmd, tick, rng,
-                                  eplog, vo, vr, vt);
+    k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, xpos, footc, af, act, prev,
+                                  cmd, tick, rng, eplog, vo, vr, vt);
 }
 
 extern "C" float my_gpu_log_into(void* log_out) {
