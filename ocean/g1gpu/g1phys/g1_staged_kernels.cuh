@@ -321,7 +321,20 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
         float c = g_ctrl[(size_t)e * ctrl_stride + a];
         float lo = g1c_act_ctrlrange[2 * a], hi = g1c_act_ctrlrange[2 * a + 1];
         c = c < lo ? lo : (c > hi ? hi : c);
-        float force = g1c_act_gain0[a] * c + g1c_act_bias1[a] * qpos[padr]
+        float force;
+#ifdef G1_PD_UNITREE
+        // Unitree legged-gym G1 PD gains on the 12 leg actuators (idx 0-11):
+        // kp 100/100/100/150/40/40 + kd 2/2/2/4/2/2 — the model's actuators
+        // have kv=0 (no velocity damping); this adds it. Identical affine form
+        // (force = kp*ctrl - kp*q - kv*qvel), so CPU model-override stays exact.
+        if (a < 12) {
+            const float KP[6] = {100.f,100.f,100.f,150.f,40.f,40.f};
+            const float KV[6] = {  2.f,  2.f,  2.f,  4.f, 2.f, 2.f};
+            int g = a % 6;
+            force = KP[g] * c - KP[g] * qpos[padr] - KV[g] * qvel[dadr];
+        } else
+#endif
+        force = g1c_act_gain0[a] * c + g1c_act_bias1[a] * qpos[padr]
                       + g1c_act_bias2[a] * qvel[dadr];
         if (g1c_jnt_actfrclimited[j]) {
             float flo = g1c_jnt_actfrcrange[2 * j], fhi = g1c_jnt_actfrcrange[2 * j + 1];

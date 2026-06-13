@@ -142,6 +142,20 @@ static void g1_load_model(void) {
     g1_model->opt.timestep = G1_WALL_TIMESTEP;
     g1_model->opt.iterations = G1_WALL_ITERATIONS;
     g1_model->opt.ls_iterations = G1_WALL_LS_ITERATIONS;
+#ifdef G1_PD_UNITREE
+    {   // Unitree legged-gym PD gains on the 12 leg actuators (kp + kd; the
+        // model lacks the kd term). Affine position-servo form: gainprm[0]=kp,
+        // biasprm[1]=-kp, biasprm[2]=-kv. GPU k3 mirrors these exactly.
+        const float KP[6] = {100.f,100.f,100.f,150.f,40.f,40.f};
+        const float KV[6] = {  2.f,  2.f,  2.f,  4.f, 2.f, 2.f};
+        for (int a = 0; a < 12; a++) {
+            int g = a % 6;
+            g1_model->actuator_gainprm[a * mjNGAIN + 0] = KP[g];
+            g1_model->actuator_biasprm[a * mjNBIAS + 1] = -KP[g];
+            g1_model->actuator_biasprm[a * mjNBIAS + 2] = -KV[g];
+        }
+    }
+#endif
 
     // Physics-parity guard: this env must run the EXACT wall physics.
     if (g1_model->opt.timestep != G1_WALL_TIMESTEP ||
