@@ -213,9 +213,29 @@ def compute_tsne(full_dataset=False):
 
     normed = np.concatenate(list(normed.values()), axis=0)
 
-    from sklearn.manifold import TSNE
-    proj = TSNE(n_components=2)
-    reduced = proj.fit_transform(normed)
+    # t-SNE is fragile on degenerate input: a small smoke whose trials share most
+    # hyperparameters yields near-identical rows -> the embedding collapses,
+    # np.std==0 -> divide-by-zero -> NaN coords -> Barnes-Hut C SEGFAULT (kills
+    # the process before experiments.json is written). Guard: only run t-SNE with
+    # enough distinct rows; otherwise emit flat tsne axes so every OTHER axis
+    # (agent_steps, env/perf, the hypers) still renders.
+    n_pts = normed.shape[0]
+    uniq = len(np.unique(np.round(normed, 9), axis=0))
+    if n_pts >= 5 and uniq >= 5 and float(np.std(normed)) > 1e-9:
+        from sklearn.manifold import TSNE
+        perplexity = min(30.0, max(2.0, uniq - 1))
+        try:
+            reduced = TSNE(n_components=2, perplexity=perplexity,
+                           init='random').fit_transform(normed)
+            if not np.all(np.isfinite(reduced)):
+                raise ValueError('non-finite t-SNE output')
+        except Exception as e:
+            print(f'  t-SNE failed ({e}); flat tsne axes')
+            reduced = np.zeros((n_pts, 2))
+    else:
+        print(f'  t-SNE skipped (degenerate: {uniq} unique rows of {n_pts}); '
+              f'flat tsne axes')
+        reduced = np.zeros((n_pts, 2))
 
     row = 0
     for env in env_names:

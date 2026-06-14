@@ -61,12 +61,14 @@ void CustomUpdateCamera(Camera *camera, float orbitSpeed) {
 #define PUFF_WHITE ((Color){241, 241, 241, 255})
 #define PUFF_BACKGROUND ((Color){6, 24, 24, 255})
 
-int hyper_count = 25;
-char *hyper_key[25] = {
+int hyper_count = 27;
+char *hyper_key[27] = {
     "agent_steps",
     "uptime",
     "env/perf",
     "env/score",
+    "time_to_walk",
+    "usd_to_walk",
     "train/learning_rate",
     "train/ent_coef",
     "train/gamma",
