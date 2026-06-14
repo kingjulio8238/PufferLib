@@ -48,8 +48,8 @@
 #define G1_V3_NUM_ACT 12
 #define G1_V3_W_BASE_HEIGHT (-10.0f)
 #define G1_V3_BASE_Z0 0.78f
-#define G1_V3_W_CROSS (-40.0f)         // anti foot-crossing (one-sided hinge)
-#define G1_V3_STANCE_MIN 0.04f         // penalize lateral gap below this (m); ~0 = crossing
+#define G1_V3_W_CROSS (-20.0f)         // anti foot-crossing (one-sided hinge)
+#define G1_V3_STANCE_MIN 0.0f          // penalize ONLY when feet cross midline (gap<0)
 #else
 #define G1_OBS_SIZE 96
 #endif
