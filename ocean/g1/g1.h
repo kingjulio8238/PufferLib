@@ -37,9 +37,9 @@
 // g1_gpu.cu) — from unitree_rl_gym's proven G1 recipe ---
 #define G1_V3_PERIOD 40
 #define G1_V3_STANCE 0.55f
-#define G1_V3_W_CONTACT 0.18f
+#define G1_V3_W_CONTACT 0.5f
 #define G1_V3_W_SWING (-20.0f)
-#define G1_V3_W_HIP (-1.0f)
+#define G1_V3_W_HIP (-4.0f)
 #define G1_V3_FOOT_Z0 0.08f
 #define G1_V3_LFOOT_BODY 7
 #define G1_V3_RFOOT_BODY 13
