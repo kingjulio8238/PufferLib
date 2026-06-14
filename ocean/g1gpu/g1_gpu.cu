@@ -307,7 +307,6 @@ __global__ void k_epi(int n,
             r += G1_V3_W_HIP * hp;
             float dzb = qpos[2] - G1_V3_BASE_Z0;
             r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
-            r = fmaxf(r, 0.0f);                     // unitree only_positive_rewards
         }
 #endif
         float reward = r * ENV_CTRL_DT;
