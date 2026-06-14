@@ -58,6 +58,8 @@
 #define G1_V3_LFOOT_BODY 7
 #define G1_V3_RFOOT_BODY 13
 #define G1_V3_NUM_ACT 12
+#define G1_V3_W_BASE_HEIGHT (-10.0f)   // unitree base_height penalty
+#define G1_V3_BASE_Z0 0.78f            // target pelvis height (m)
 #else
 #define ENV_OBS 96
 #endif
@@ -303,6 +305,9 @@ __global__ void k_epi(int n,
                 hp += dq * dq;
             }
             r += G1_V3_W_HIP * hp;
+            float dzb = qpos[2] - G1_V3_BASE_Z0;
+            r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
+            r = fmaxf(r, 0.0f);                     // unitree only_positive_rewards
         }
 #endif
         float reward = r * ENV_CTRL_DT;

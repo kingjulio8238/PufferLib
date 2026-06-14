@@ -46,6 +46,8 @@
 #define G1_V3_LFOOT_GEOM 17
 #define G1_V3_RFOOT_GEOM 31
 #define G1_V3_NUM_ACT 12
+#define G1_V3_W_BASE_HEIGHT (-10.0f)
+#define G1_V3_BASE_Z0 0.78f
 #else
 #define G1_OBS_SIZE 96
 #endif
@@ -392,6 +394,9 @@ void c_step(G1* env) {
             hp += dq * dq;
         }
         r += G1_V3_W_HIP * hp;
+        float dzb = (float)(d->qpos[2]) - G1_V3_BASE_Z0;
+        r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
+        r = r < 0.0f ? 0.0f : r;                // unitree only_positive_rewards
     }
 #endif
     float reward = r * G1_CTRL_DT;
