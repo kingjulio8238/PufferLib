@@ -381,7 +381,13 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [match_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
-            result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+            # Optimize the CONFIGURED metric (target_key = env/<sweep.metric>),
+            # not a hardcoded env/score. For g1gpu, metric=perf -> the lin-vel
+            # tracking kernel (the frozen walk metric), not raw return (which
+            # w_alive=25 dominates). Falls back to env/score if the env doesn't
+            # emit the target (target_key existence is already guarded @309).
+            sweep_metric = metrics.get(target_key, metrics['env/score'])
+            result_queue.put((args['gpu_id'], sweep_metric, metrics['uptime'], metrics['agent_steps']))
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
