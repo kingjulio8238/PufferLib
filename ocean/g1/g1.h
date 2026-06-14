@@ -48,6 +48,8 @@
 #define G1_V3_NUM_ACT 12
 #define G1_V3_W_BASE_HEIGHT (-10.0f)
 #define G1_V3_BASE_Z0 0.78f
+#define G1_V3_W_CROSS (-40.0f)         // anti foot-crossing (one-sided hinge)
+#define G1_V3_STANCE_MIN 0.04f         // penalize lateral gap below this (m); ~0 = crossing
 #else
 #define G1_OBS_SIZE 96
 #endif
@@ -396,6 +398,17 @@ void c_step(G1* env) {
         r += G1_V3_W_HIP * hp;
         float dzb = (float)(d->qpos[2]) - G1_V3_BASE_Z0;
         r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
+        // anti foot-crossing: signed lateral foot gap (left-right) in base frame.
+        mjtNum dxl[3], dxr[3];
+        for (int k = 0; k < 3; k++) {
+            dxl[k] = d->xpos[3 * G1_V3_LFOOT_BODY + k] - d->qpos[k];
+            dxr[k] = d->xpos[3 * G1_V3_RFOOT_BODY + k] - d->qpos[k];
+        }
+        mjtNum bl[3], br[3];
+        g1_world_to_base(d->qpos + 3, dxl, bl);
+        g1_world_to_base(d->qpos + 3, dxr, br);
+        float cg = G1_V3_STANCE_MIN - (float)(bl[1] - br[1]);   // >0 when crossed
+        if (cg > 0.0f) r += G1_V3_W_CROSS * cg * cg;
     }
 #endif
     float reward = r * G1_CTRL_DT;
