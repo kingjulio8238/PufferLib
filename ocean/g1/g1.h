@@ -48,8 +48,6 @@
 #define G1_V3_NUM_ACT 12
 #define G1_V3_W_BASE_HEIGHT (-10.0f)
 #define G1_V3_BASE_Z0 0.78f
-#define G1_V3_W_CROSS (-20.0f)         // anti foot-crossing (one-sided hinge)
-#define G1_V3_STANCE_MIN 0.0f          // penalize ONLY when feet cross midline (gap<0)
 #else
 #define G1_OBS_SIZE 96
 #endif
@@ -357,11 +355,16 @@ void c_step(G1* env) {
         env->prev_action[j] = a[j];
     }
 
+    // competence gate (parity with g1_gpu.cu): torso-wobble penalty applies
+    // only once upright, fading to 0 toward a fall -> strong weight, no
+    // acquisition fight.
+    float upr = (-(float)pg[2] - 0.75f) * 4.0f;
+    upr = upr < 0.0f ? 0.0f : (upr > 1.0f ? 1.0f : upr);
     float r = env->w_alive
             + env->w_track_lin * track_lin
             + env->w_track_ang * track_ang
             + env->w_lin_vel_z * (float)(vel_base[2] * vel_base[2])
-            + env->w_ang_vel_xy * (float)(wx * wx + wy * wy)
+            + env->w_ang_vel_xy * (float)(wx * wx + wy * wy) * upr
             + env->w_orientation * (float)(pg[0] * pg[0] + pg[1] * pg[1])
             + env->w_torque * torque2
             + env->w_action_rate * act_rate2;
@@ -398,17 +401,6 @@ void c_step(G1* env) {
         r += G1_V3_W_HIP * hp;
         float dzb = (float)(d->qpos[2]) - G1_V3_BASE_Z0;
         r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
-        // anti foot-crossing: signed lateral foot gap (left-right) in base frame.
-        mjtNum dxl[3], dxr[3];
-        for (int k = 0; k < 3; k++) {
-            dxl[k] = d->xpos[3 * G1_V3_LFOOT_BODY + k] - d->qpos[k];
-            dxr[k] = d->xpos[3 * G1_V3_RFOOT_BODY + k] - d->qpos[k];
-        }
-        mjtNum bl[3], br[3];
-        g1_world_to_base(d->qpos + 3, dxl, bl);
-        g1_world_to_base(d->qpos + 3, dxr, br);
-        float cg = G1_V3_STANCE_MIN - (float)(bl[1] - br[1]);   // >0 when crossed
-        if (cg > 0.0f) r += G1_V3_W_CROSS * cg * cg;
     }
 #endif
     float reward = r * G1_CTRL_DT;

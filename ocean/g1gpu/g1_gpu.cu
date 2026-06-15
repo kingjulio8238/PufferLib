@@ -60,9 +60,6 @@
 #define G1_V3_NUM_ACT 12
 #define G1_V3_W_BASE_HEIGHT (-10.0f)   // unitree base_height penalty
 #define G1_V3_BASE_Z0 0.78f            // target pelvis height (m)
-#define G1_V3_W_CROSS (-20.0f)         // anti foot-crossing (one-sided hinge)
-#define G1_V3_STANCE_MIN 0.0f          // penalize ONLY when feet cross midline (gap<0);
-                                       // margin>0 punished normal near-together swing -> killed gait
 #else
 #define ENV_OBS 96
 #endif
@@ -275,11 +272,17 @@ __global__ void k_epi(int n,
         float track_lin = expf(-lin_err2 / 0.25f);
         float eyaw = g_cmd[3*e+2] - wz;
         float track_ang = expf(-eyaw * eyaw / 0.25f);
+        // competence gate: the torso-wobble penalty applies only once upright
+        // (pg.z=-1), fading to 0 as the torso tilts toward a fall (pg.z=-0.75).
+        // Lets w_ang_vel_xy be STRONG (bites a competent walker) without
+        // punishing early flailing or fall-recovery -> no acquisition fight.
+        float upr = (-pg[2] - 0.75f) * 4.0f;
+        upr = upr < 0.0f ? 0.0f : (upr > 1.0f ? 1.0f : upr);
         float r = g1e_w_alive
                 + g1e_w_track_lin * track_lin
                 + g1e_w_track_ang * track_ang
                 + g1e_w_lin_vel_z * vb[2] * vb[2]
-                + g1e_w_ang_vel_xy * (wx * wx + wy * wy)
+                + g1e_w_ang_vel_xy * (wx * wx + wy * wy) * upr
                 + g1e_w_orientation * (pg[0] * pg[0] + pg[1] * pg[1])
                 + g1e_w_torque * t2
                 + g1e_w_action_rate * ar2;
@@ -310,19 +313,6 @@ __global__ void k_epi(int n,
             r += G1_V3_W_HIP * hp;
             float dzb = qpos[2] - G1_V3_BASE_Z0;
             r += G1_V3_W_BASE_HEIGHT * dzb * dzb;   // unitree base_height
-            // anti foot-crossing: signed lateral foot gap (left-right) in base frame.
-            // nominal stance gap is positive (~hip width); penalize only when it
-            // collapses below STANCE_MIN toward/through zero (= feet crossing).
-            float dxl[3], dxr[3];
-            for (int k = 0; k < 3; k++) {
-                dxl[k] = g_xpos[(size_t)e * S_X3 + 3 * G1_V3_LFOOT_BODY + k] - qpos[k];
-                dxr[k] = g_xpos[(size_t)e * S_X3 + 3 * G1_V3_RFOOT_BODY + k] - qpos[k];
-            }
-            float bl[3], br[3];
-            world_to_base(qpos + 3, dxl, bl);
-            world_to_base(qpos + 3, dxr, br);
-            float cg = G1_V3_STANCE_MIN - (bl[1] - br[1]);   // >0 when too close / crossed
-            if (cg > 0.0f) r += G1_V3_W_CROSS * cg * cg;
         }
 #endif
         float reward = r * ENV_CTRL_DT;
