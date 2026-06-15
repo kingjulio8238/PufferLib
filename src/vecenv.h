@@ -287,7 +287,14 @@ static void* static_omp_threadmanager(void* arg) {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             net_callback(ctx, buf, t);
 
+#ifndef PIPELINE_ROLLOUT
+            // Per-step sync: only needed for the EVAL_GPU/EVAL_ENV_STEP timing split.
+            // Inference and the env step both run on `stream` (tl_stream == streams[buf]),
+            // so they are already ordered without it. PIPELINE_ROLLOUT drops it so the
+            // CPU runs ahead and keeps the GPU fed across the horizon (one sync at L343
+            // before the buffer is handed to train still bounds the rollout). Bit-exact.
             cudaStreamSynchronize(stream);
+#endif
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 
@@ -300,7 +307,9 @@ static void* static_omp_threadmanager(void* arg) {
                 (char*)vec->gpu_observations + (size_t)agent_start * OBS_SIZE * obs_element_size(),
                 &vec->gpu_rewards[agent_start],
                 &vec->gpu_terminals[agent_start]);
-            cudaStreamSynchronize(stream);
+#ifndef PIPELINE_ROLLOUT
+            cudaStreamSynchronize(stream);   // see note above; dropped under PIPELINE_ROLLOUT
+#endif
 #else
             cudaMemcpyAsync(
                 &vec->actions[agent_start * NUM_ATNS],
