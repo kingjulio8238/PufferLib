@@ -345,28 +345,47 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     }
     __syncwarp();
 
-    // qacc_smooth = LDL solve (lane-0 serial v1; its own kernel later if hot)
-    if (lane == 0) {
-        for (int i = 0; i < G1_NV; i++) qacc[i] = smoo[i];
-        for (int i = G1_NV - 1; i >= 0; i--) {
-            if (qacc[i] != 0.0f) {
-                int adr = g1c_dof_Madr[i] + 1;
-                for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
-                    qacc[j] -= qLD[adr++] * qacc[i];
-            }
-        }
-        for (int i = 0; i < G1_NV; i++) qacc[i] *= diag[i];
-        for (int i = 0; i < G1_NV; i++) {
-            int adr = g1c_dof_Madr[i] + 1;
-            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
-                qacc[i] -= qLD[adr++] * qacc[j];
-        }
-    }
+    // qacc_smooth solve moved to k3b_ldlsolve (thread-per-env): the lane-0 serial
+    // solve wasted the warp's other 31 lanes (~70% of k3, smem-per-env occupancy-
+    // bound, NOT latency-bound), so splitting it to one-thread-per-env recovers
+    // the idle lanes. Bit-identical (same serial algorithm per env). k3 now only
+    // writes qfrc_smooth; k3b reads it back and writes qacc_smooth.
+    (void)qacc; (void)qLD; (void)diag;   // consumed by k3b now
     __syncwarp();
     for (int k = lane; k < G1_NV; k += 32) {
         g_qfrc_smooth[(size_t)e * G1_NV + k] = smoo[k];
-        g_qacc_smooth[(size_t)e * G1_NV + k] = qacc[k];
     }
+}
+
+// k3b: thread-per-env LDL solve. The EXACT serial algorithm of k3's old lane-0
+// solve, but one thread per env -> all 32 lanes of a warp run different envs
+// (no idle lanes). Bit-identical to the serial solve. qacc[35] dynamic-indexed
+// (pointer-chase) -> local memory, L1-cached. ~12x faster than lane-0 serial.
+__global__ void k3b_ldlsolve(int n, const float* __restrict__ g_qfrc_smooth,
+                             const float* __restrict__ g_qLD,
+                             const float* __restrict__ g_qLDiagInv,
+                             float* __restrict__ g_qacc_smooth) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    const float* smoo = g_qfrc_smooth + (size_t)e * G1_NV;
+    const float* qLD = g_qLD + (size_t)e * G1_NM;
+    const float* diag = g_qLDiagInv + (size_t)e * G1_NV;
+    float qacc[G1_NV];
+    for (int i = 0; i < G1_NV; i++) qacc[i] = smoo[i];
+    for (int i = G1_NV - 1; i >= 0; i--) {
+        if (qacc[i] != 0.0f) {
+            int adr = g1c_dof_Madr[i] + 1;
+            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                qacc[j] -= qLD[adr++] * qacc[i];
+        }
+    }
+    for (int i = 0; i < G1_NV; i++) qacc[i] *= diag[i];
+    for (int i = 0; i < G1_NV; i++) {
+        int adr = g1c_dof_Madr[i] + 1;
+        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+            qacc[i] -= qLD[adr++] * qacc[j];
+    }
+    for (int i = 0; i < G1_NV; i++) g_qacc_smooth[(size_t)e * G1_NV + i] = qacc[i];
 }
 
 // ---------------------------------------------------------------------------

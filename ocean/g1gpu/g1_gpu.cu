@@ -567,6 +567,9 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         k2_crb_factor<<<blocks, tpb, 0, st>>>(n, cinert, cdof, qM, qLD, qLDiagInv);
         k3_rne_act_solve<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ctrl, S_NU, cinert,
                                                  cdof, qLD, qLDiagInv, qfs, qas, af);
+        // k3b: thread-per-env LDL solve (recovers the 31 idle lanes of k3's old
+        // lane-0 solve; bit-identical). Thread-per-env grid, not warp-per-env.
+        k3b_ldlsolve<<<(n + 255) / 256, 256, 0, st>>>(n, qfs, qLD, qLDiagInv, qas);
         k5_assemble<<<blocks, tpb, 0, st>>>(n, qpos, qvel, xpos, xquat, com, ncon,
                                             nefc, condist, rowtype, rowdof, rowsign,
                                             rowstash, rpos, D, R, aref, cJ, cdof,
