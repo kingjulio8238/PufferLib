@@ -1076,25 +1076,28 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
              - g_qfc[(size_t)e * nv + i];
     __syncwarp();
 #ifdef SPARSE_SOLVER
-    // sparse LDL solve x <- H^-1 x against HLD/HLDiagInv from k7 (k3b algorithm).
+    // sparse LDL solve x <- H^-1 x (lane-parallel over ancestors, serial over dof):
+    // phase1 back (scatter to distinct ancestors), phase2 diag, phase3 fwd (reduce).
     const float* HLD = g_H + (size_t)e * (size_t)G1_TRI;
     const float* HLDiag = g_H + (size_t)e * (size_t)G1_TRI + G1_NM;
-    if (lane == 0) {
-        for (int i = G1_NV - 1; i >= 0; i--) {
-            if (x[i] != 0.0f) {
-                int adr = g1c_dof_Madr[i] + 1;
-                for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
-                    x[j] -= HLD[adr++] * x[i];
-            }
-        }
-        for (int i = 0; i < G1_NV; i++) x[i] *= HLDiag[i];
-        for (int i = 0; i < G1_NV; i++) {
-            int adr = g1c_dof_Madr[i] + 1;
-            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
-                x[i] -= HLD[adr++] * x[j];
-        }
+    for (int k = G1_NV - 1; k >= 0; k--) {
+        int Madr_kk = g1c_dof_Madr[k];
+        int nanc = (k < G1_NV - 1 ? g1c_dof_Madr[k + 1] : G1_NM) - Madr_kk - 1;
+        float xk = x[k];
+        if (lane < nanc)
+            x[g1c_dof_chain[k * G1_MAX_CHAIN + lane]] -= HLD[Madr_kk + 1 + lane] * xk;
+        __syncwarp();
     }
+    for (int i = lane; i < G1_NV; i += 32) x[i] *= HLDiag[i];
     __syncwarp();
+    for (int i = 0; i < G1_NV; i++) {
+        int Madr_ii = g1c_dof_Madr[i];
+        int nanc = (i < G1_NV - 1 ? g1c_dof_Madr[i + 1] : G1_NM) - Madr_ii - 1;
+        float s = (lane < nanc) ? HLD[Madr_ii + 1 + lane] * x[g1c_dof_chain[i * G1_MAX_CHAIN + lane]] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+        if (lane == 0) x[i] -= s;
+        __syncwarp();
+    }
 #else
     float* L = s_L[warp];
     for (int k = lane; k < G1_TRI; k += 32)
