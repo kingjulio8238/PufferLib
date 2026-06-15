@@ -283,7 +283,7 @@ __global__ void k_epi(int n,
                 + g1e_w_track_ang * track_ang
                 + g1e_w_lin_vel_z * vb[2] * vb[2]
                 + g1e_w_ang_vel_xy * (wx * wx + wy * wy) * upr
-                + g1e_w_orientation * (pg[0] * pg[0] + pg[1] * pg[1])
+                + g1e_w_orientation * (pg[0] * pg[0] + pg[1] * pg[1]) * upr
                 + g1e_w_torque * t2
                 + g1e_w_action_rate * ar2;
 #ifdef G1_TASK_V3

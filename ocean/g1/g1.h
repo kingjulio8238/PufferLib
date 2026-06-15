@@ -365,7 +365,7 @@ void c_step(G1* env) {
             + env->w_track_ang * track_ang
             + env->w_lin_vel_z * (float)(vel_base[2] * vel_base[2])
             + env->w_ang_vel_xy * (float)(wx * wx + wy * wy) * upr
-            + env->w_orientation * (float)(pg[0] * pg[0] + pg[1] * pg[1])
+            + env->w_orientation * (float)(pg[0] * pg[0] + pg[1] * pg[1]) * upr
             + env->w_torque * torque2
             + env->w_action_rate * act_rate2;
 #ifdef G1_TASK_V3
