@@ -586,6 +586,11 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                                             nefc, condist, rowtype, rowdof, rowsign,
                                             rowstash, rpos, D, R, aref, cJ, cdof,
                                             footc);
+#ifndef SKIP_SOLVER   // ceiling probe: skip the whole Newton solver (k6 + SOL_ITER
+                      // x [k7..k10]) and integrate the unconstrained smooth accel
+                      // (qas) instead of the constrained qaccF. Garbage contacts,
+                      // SPS-only. Measures the solver's TRUE end-to-end share: if SPS
+                      // rises ~proportionally, a sparse-factor solver would translate.
         k6_wsinit<<<blocks, tpb, 0, st>>>(n, qM, qfs, qas, ws, nefc, rowtype, rowdof,
                                           rowsign, D, R, aref, cJ, qaccF, Ma, jaref,
                                           force, state, qfc, scal, hvalid);
@@ -605,6 +610,11 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         k4_euler<<<blocks, tpb, 0, st>>>(n, qpos, qvel, qaccF);
         CUDA_CHECK(cudaMemcpyAsync(ws, qaccF, (size_t)n * S_NV * 4,
                                    cudaMemcpyDeviceToDevice, st));
+#else
+        k4_euler<<<blocks, tpb, 0, st>>>(n, qpos, qvel, qas);
+        CUDA_CHECK(cudaMemcpyAsync(ws, qas, (size_t)n * S_NV * 4,
+                                   cudaMemcpyDeviceToDevice, st));
+#endif
     }
 #endif  // SKIP_PHYSICS
     k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, xpos, footc, af, act, prev,
