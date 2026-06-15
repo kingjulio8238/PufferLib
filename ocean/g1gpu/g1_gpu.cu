@@ -69,6 +69,10 @@ __device__ float g1e_action_scale, g1e_w_track_lin, g1e_w_track_ang;
 __device__ float g1e_w_lin_vel_z, g1e_w_ang_vel_xy, g1e_w_orientation;
 __device__ float g1e_w_torque, g1e_w_action_rate, g1e_w_alive, g1e_w_termination;
 __device__ int g1e_max_ep_len;
+// command-curriculum scale (1.0 = full range; ramped 0->1 by the host under
+// G1_CURRICULUM). Multiplies the sampled velocity command so early training
+// sees slow/easy commands, widening to the full distribution as it learns.
+__device__ float g1e_cmd_scale = 1.0f;
 
 // ---------------------------------------------------------------------------
 // device helpers (validated semantics from stagedenv.cu)
@@ -140,9 +144,9 @@ __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
         if (urand_01(&rng) < 0.1f) {
             g_cmd[3 * e] = g_cmd[3 * e + 1] = g_cmd[3 * e + 2] = 0.0f;
         } else {
-            g_cmd[3 * e + 0] = 1.0f * urand_pm1(&rng);
-            g_cmd[3 * e + 1] = 0.6f * urand_pm1(&rng);
-            g_cmd[3 * e + 2] = 1.0f * urand_pm1(&rng);
+            g_cmd[3 * e + 0] = g1e_cmd_scale * 1.0f * urand_pm1(&rng);
+            g_cmd[3 * e + 1] = g1e_cmd_scale * 0.6f * urand_pm1(&rng);
+            g_cmd[3 * e + 2] = g1e_cmd_scale * 1.0f * urand_pm1(&rng);
         }
         g_rng[e] = rng;
         g_tick[e] = 0;
@@ -351,9 +355,9 @@ __global__ void k_epi(int n,
         if (urand_01(&rng) < 0.1f) {
             g_cmd[3*e] = g_cmd[3*e+1] = g_cmd[3*e+2] = 0.0f;
         } else {
-            g_cmd[3*e+0] = 1.0f * urand_pm1(&rng);
-            g_cmd[3*e+1] = 0.6f * urand_pm1(&rng);
-            g_cmd[3*e+2] = 1.0f * urand_pm1(&rng);
+            g_cmd[3*e+0] = g1e_cmd_scale * 1.0f * urand_pm1(&rng);
+            g_cmd[3*e+1] = g1e_cmd_scale * 0.6f * urand_pm1(&rng);
+            g_cmd[3*e+2] = g1e_cmd_scale * 1.0f * urand_pm1(&rng);
         }
         g_rng[e] = rng;
     }
@@ -489,6 +493,21 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     int blocks = (n + SWARPS - 1) / SWARPS;
     dim3 tpb(32 * SWARPS);
     size_t s = (size_t)start;
+
+#ifdef G1_CURRICULUM
+    {   // command curriculum: ramp the velocity-command range from CS_START to
+        // 1.0 over CS_RAMP samples, so early training learns the gait on slow
+        // commands and widens to the full distribution as it gets competent.
+        static long g_curric_steps = 0;
+        const float  CS_START = 0.4f;
+        const double CS_RAMP  = 40.0e6;   // samples to reach the full range
+        g_curric_steps += n;
+        double prog = (double)g_curric_steps / CS_RAMP;
+        float cs = CS_START + (1.0f - CS_START) * (float)(prog < 1.0 ? prog : 1.0);
+        cudaMemcpyToSymbolAsync(g1e_cmd_scale, &cs, sizeof(float), 0,
+                                cudaMemcpyHostToDevice, st);
+    }
+#endif
 
     // offset views: every kernel indexes envs 0..count-1 relative to start
     float* qpos = p_qpos + s * S_NQ;
