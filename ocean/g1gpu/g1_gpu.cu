@@ -567,6 +567,11 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     // pointers -> safe to CUDA-graph-capture.
     auto step_body = [&]() {
     k_act<<<blocks, tpb, 0, st>>>(n, va, act, ctrl);
+#ifndef SKIP_PHYSICS   // ceiling probe: skip the entire physics decimation loop
+                       // (k1..k4). Only k_act + k_epi run -> env GPU work ~0.
+                       // If training SPS is unchanged vs baseline, the physics is
+                       // NOT on the critical path (learner/inference-bound); if it
+                       // jumps, physics IS the wall. Garbage dynamics, SPS-only.
     for (int k = 0; k < ENV_DECIMATION; k++) {
         k1_fk_compos<<<blocks, tpb, 0, st>>>(n, qpos, xpos, xquat, com, cinert, cdof);
         k2_crb_factor<<<blocks, tpb, 0, st>>>(n, cinert, cdof, qM, qLD, qLDiagInv);
@@ -601,6 +606,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         CUDA_CHECK(cudaMemcpyAsync(ws, qaccF, (size_t)n * S_NV * 4,
                                    cudaMemcpyDeviceToDevice, st));
     }
+#endif  // SKIP_PHYSICS
     k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, xpos, footc, af, act, prev,
                                   cmd, tick, rng, eplog, vo, vr, vt);
     };
