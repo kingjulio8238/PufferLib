@@ -919,7 +919,11 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
                            const float* __restrict__ g_scal,
                            float* __restrict__ g_H,
                            int* __restrict__ g_hvalid) {
+#ifdef SPARSE_SOLVER
+    __shared__ float s_HLD[SWARPS][G1_NM];   // sparse tree factor (341) vs dense 630
+#else
     __shared__ float s_H[SWARPS][G1_TRI];
+#endif
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
@@ -930,7 +934,6 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     // g_hvalid == nullptr disables memoization (large batches: the active-set
     // read-back in k10 costs more than the skipped rebuilds save).
     if (g_hvalid && g_hvalid[e]) return;
-    float* H = s_H[warp];
     const int nv = G1_NV;
     const float* qM = g_qM + (size_t)e * G1_NM;
     int nefc = g_nefc[e];
@@ -940,6 +943,59 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     const int* state = g_state + (size_t)e * NEFC_MAX;
     const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
 
+#ifdef SPARSE_SOLVER
+    // sparse tree-structured build + LDL factor (reuses k2's mj_factorI_legacy).
+    // H = M + J'DJ has exactly M's 341-pattern (contacts are tree-chains, 0 fill).
+    float* HLD = s_HLD[warp];
+    for (int k = lane; k < G1_NM; k += 32) HLD[k] = qM[k];   // H = M
+    __syncwarp();
+    for (int r = lane; r < nefc; r += 32) {                  // joint-limit diagonal
+        if (state[r] != ST_QUAD || rt[r] == ROW_CONTACT) continue;
+        atomicAdd(&HLD[g1c_dof_Madr[rd[r]]], D[r]);
+    }
+    __syncwarp();
+    for (int r = 0; r < nefc; r++) {                         // J'DJ (in-pattern)
+        if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
+        float Dr = D[r];
+        const float* J = cJ + rd[r] * G1_NV;
+        for (int i = lane; i < nv; i += 32) {
+            float Ji = J[i];
+            if (Ji == 0.0f) continue;
+            float DJi = Dr * Ji;
+            int adr = g1c_dof_Madr[i];
+            HLD[adr++] += DJi * Ji;
+            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j]) {
+                float Jj = J[j];
+                if (Jj != 0.0f) HLD[adr] += DJi * Jj;
+                adr++;
+            }
+        }
+        __syncwarp();
+    }
+    for (int k = G1_NV - 1; k >= 0; k--) {                   // tree-order LDL factor (= k2)
+        int Madr_kk = g1c_dof_Madr[k];
+        int nanc = (k < G1_NV - 1 ? g1c_dof_Madr[k + 1] : G1_NM) - Madr_kk - 1;
+        int ci = (lane < nanc) ? g1c_dof_chain[k * G1_MAX_CHAIN + lane] : -1;
+        float tmp = 0.0f;
+        if (ci >= 0) tmp = HLD[Madr_kk + 1 + lane] / HLD[Madr_kk];
+        __syncwarp();
+        if (ci >= 0) {
+            int cnt = g1c_dof_Madr[ci + 1] - g1c_dof_Madr[ci];
+            for (int c = 0; c < cnt; c++)
+                HLD[g1c_dof_Madr[ci] + c] -= HLD[Madr_kk + 1 + lane + c] * tmp;
+        }
+        __syncwarp();
+        if (ci >= 0) HLD[Madr_kk + 1 + lane] = tmp;
+        __syncwarp();
+    }
+    for (int k = lane; k < G1_NM; k += 32)                   // store HLD + HLDiagInv in g_H
+        g_H[(size_t)e * (size_t)G1_TRI + k] = HLD[k];
+    for (int i = lane; i < nv; i += 32)
+        g_H[(size_t)e * (size_t)G1_TRI + G1_NM + i] = 1.0f / HLD[g1c_dof_Madr[i]];
+    if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
+    return;
+#else
+    float* H = s_H[warp];
     for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
     __syncwarp();
     for (int i = lane; i < nv; i += 32) {
@@ -981,6 +1037,7 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     for (int k = lane; k < G1_TRI; k += 32)
         g_H[(size_t)e * (size_t)G1_TRI + k] = H[k];
     if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
+#endif  // SPARSE_SOLVER (dense path)
 }
 
 // ---------------------------------------------------------------------------
@@ -998,7 +1055,9 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
                                const float* __restrict__ g_cJ,
                                float* __restrict__ g_search, float* __restrict__ g_Mv,
                                float* __restrict__ g_jv, float* __restrict__ g_scal) {
+#ifndef SPARSE_SOLVER
     __shared__ float s_L[SWARPS][G1_TRI];
+#endif
     __shared__ float s_x[SWARPS][G1_NV];
     __shared__ float s_srch[SWARPS][G1_NV];
     __shared__ float s_Mv[SWARPS][G1_NV];
@@ -1007,17 +1066,39 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
     if (e >= n) return;
     float* scal = g_scal + (size_t)e * NSCAL;
     if (scal[SC_DONE] != 0.0f) return;
-    float* L = s_L[warp];
     float* x = s_x[warp];
     float* srch = s_srch[warp];
     float* Mv = s_Mv[warp];
     const int nv = G1_NV;
 
-    for (int k = lane; k < G1_TRI; k += 32)
-        L[k] = g_H[(size_t)e * (size_t)G1_TRI + k];
     for (int i = lane; i < nv; i += 32)
         x[i] = g_Ma[(size_t)e * nv + i] - g_qfs[(size_t)e * nv + i]
              - g_qfc[(size_t)e * nv + i];
+    __syncwarp();
+#ifdef SPARSE_SOLVER
+    // sparse LDL solve x <- H^-1 x against HLD/HLDiagInv from k7 (k3b algorithm).
+    const float* HLD = g_H + (size_t)e * (size_t)G1_TRI;
+    const float* HLDiag = g_H + (size_t)e * (size_t)G1_TRI + G1_NM;
+    if (lane == 0) {
+        for (int i = G1_NV - 1; i >= 0; i--) {
+            if (x[i] != 0.0f) {
+                int adr = g1c_dof_Madr[i] + 1;
+                for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                    x[j] -= HLD[adr++] * x[i];
+            }
+        }
+        for (int i = 0; i < G1_NV; i++) x[i] *= HLDiag[i];
+        for (int i = 0; i < G1_NV; i++) {
+            int adr = g1c_dof_Madr[i] + 1;
+            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                x[i] -= HLD[adr++] * x[j];
+        }
+    }
+    __syncwarp();
+#else
+    float* L = s_L[warp];
+    for (int k = lane; k < G1_TRI; k += 32)
+        L[k] = g_H[(size_t)e * (size_t)G1_TRI + k];
     __syncwarp();
     // x <- (L L')^-1 x, column sweeps
     for (int j = 0; j < nv; j++) {
@@ -1034,6 +1115,7 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
         for (int i = lane; i < j; i += 32) x[i] -= L[tridx(j, i)] * xj;
         __syncwarp();
     }
+#endif
     for (int i = lane; i < nv; i += 32) srch[i] = -x[i];
     __syncwarp();
     mul_M_vec_g(g_qM + (size_t)e * G1_NM, srch, Mv, lane);
