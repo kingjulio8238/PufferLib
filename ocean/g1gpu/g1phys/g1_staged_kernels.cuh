@@ -345,16 +345,38 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     }
     __syncwarp();
 
-    // qacc_smooth solve moved to k3b_ldlsolve (thread-per-env): the lane-0 serial
-    // solve wasted the warp's other 31 lanes (~70% of k3, smem-per-env occupancy-
-    // bound, NOT latency-bound), so splitting it to one-thread-per-env recovers
-    // the idle lanes. Bit-identical (same serial algorithm per env). k3 now only
-    // writes qfrc_smooth; k3b reads it back and writes qacc_smooth.
-    (void)qacc; (void)qLD; (void)diag;   // consumed by k3b now
+#ifndef K3_SPLIT
+    // qacc_smooth = LDL solve (lane-0 serial v1; its own kernel later if hot)
+    if (lane == 0) {
+        for (int i = 0; i < G1_NV; i++) qacc[i] = smoo[i];
+        for (int i = G1_NV - 1; i >= 0; i--) {
+            if (qacc[i] != 0.0f) {
+                int adr = g1c_dof_Madr[i] + 1;
+                for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                    qacc[j] -= qLD[adr++] * qacc[i];
+            }
+        }
+        for (int i = 0; i < G1_NV; i++) qacc[i] *= diag[i];
+        for (int i = 0; i < G1_NV; i++) {
+            int adr = g1c_dof_Madr[i] + 1;
+            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                qacc[i] -= qLD[adr++] * qacc[j];
+        }
+    }
+    __syncwarp();
+    for (int k = lane; k < G1_NV; k += 32) {
+        g_qfrc_smooth[(size_t)e * G1_NV + k] = smoo[k];
+        g_qacc_smooth[(size_t)e * G1_NV + k] = qacc[k];
+    }
+#else
+    // K3_SPLIT: qacc_smooth solve moved to k3b_ldlsolve (thread-per-env). k3 only
+    // writes qfrc_smooth; k3b reads it back and writes qacc_smooth (bit-identical).
+    (void)qacc; (void)qLD; (void)diag;
     __syncwarp();
     for (int k = lane; k < G1_NV; k += 32) {
         g_qfrc_smooth[(size_t)e * G1_NV + k] = smoo[k];
     }
+#endif
 }
 
 // k3b: thread-per-env LDL solve. The EXACT serial algorithm of k3's old lane-0

@@ -561,15 +561,22 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     float* vr = vec_rew;
     float* vt = vec_term;
 
+    // The full control step as a single callable: k_act + decimation x
+    // [k1..k4 (+k3b)] + k_epi. ~70 async kernel launches + D2D memcpy on stream
+    // st, fixed sequence (decimation/SOL_ITER compile-time), per-buffer-stable
+    // pointers -> safe to CUDA-graph-capture.
+    auto step_body = [&]() {
     k_act<<<blocks, tpb, 0, st>>>(n, va, act, ctrl);
     for (int k = 0; k < ENV_DECIMATION; k++) {
         k1_fk_compos<<<blocks, tpb, 0, st>>>(n, qpos, xpos, xquat, com, cinert, cdof);
         k2_crb_factor<<<blocks, tpb, 0, st>>>(n, cinert, cdof, qM, qLD, qLDiagInv);
         k3_rne_act_solve<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ctrl, S_NU, cinert,
                                                  cdof, qLD, qLDiagInv, qfs, qas, af);
+#ifdef K3_SPLIT
         // k3b: thread-per-env LDL solve (recovers the 31 idle lanes of k3's old
         // lane-0 solve; bit-identical). Thread-per-env grid, not warp-per-env.
         k3b_ldlsolve<<<(n + 255) / 256, 256, 0, st>>>(n, qfs, qLD, qLDiagInv, qas);
+#endif
         k5_assemble<<<blocks, tpb, 0, st>>>(n, qpos, qvel, xpos, xquat, com, ncon,
                                             nefc, condist, rowtype, rowdof, rowsign,
                                             rowstash, rpos, D, R, aref, cJ, cdof,
@@ -596,6 +603,31 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     }
     k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, xpos, footc, af, act, prev,
                                   cmd, tick, rng, eplog, vo, vr, vt);
+    };
+
+#ifdef GRAPH_ENV_STEP
+    // Capture the whole control-step sequence into a CUDA graph ONCE per worker
+    // thread (each thread owns one fixed buffer/stream/start -> thread_local cache,
+    // no locking) and replay it every step. Collapses ~70 eager launch+gap
+    // latencies into ONE cudaGraphLaunch. Targets the env-step WALL, which k3b
+    // showed is gap-bound (gpu_busy -12% moved the wall ~0%), not gpu_busy-bound.
+    // Bit-exact: replays identical kernels on identical device pointers.
+    static thread_local cudaGraphExec_t g_exec = nullptr;
+    static thread_local int g_key = -1;
+    if (g_exec == nullptr || g_key != start) {
+        if (g_exec) { cudaGraphExecDestroy(g_exec); g_exec = nullptr; }
+        CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        step_body();
+        cudaGraph_t graph;
+        CUDA_CHECK(cudaStreamEndCapture(st, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&g_exec, graph, 0));
+        cudaGraphDestroy(graph);
+        g_key = start;
+    }
+    CUDA_CHECK(cudaGraphLaunch(g_exec, st));
+#else
+    step_body();
+#endif
 }
 
 extern "C" float my_gpu_log_into(void* log_out) {
