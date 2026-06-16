@@ -1550,6 +1550,12 @@ void train_impl(PuffeRL& pufferl) {
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
     for (int mb = 0; mb < total_minibatches; ++mb) {
         cudaEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
+#ifdef SKIP_ADV_ZERO
+        // graph audit #2: the vectorized advantage path (puff_advantage_row_vec) writes
+        // EVERY element incl. the last, so this full-buffer memset is redundant there.
+        // The scalar path doesn't write advantages[horizon-1], so keep the zero for it.
+        if (hypers.horizon % (16 / (int)sizeof(precision_t)) != 0)
+#endif
         puf_zero(&advantages_puf, train_stream);
 
         profile_begin("compute_advantage", hypers.profile);
@@ -1616,12 +1622,19 @@ void train_impl(PuffeRL& pufferl) {
             policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
+#ifdef FUSE_MUON_BF16_CAST
+            // graph audit #3: emit the bf16 param copy inside muon_weight_update
+            // (kills a full-param read+write + 1 launch/mb). Bit-exact.
+            muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf,
+                hypers.max_grad_norm, stream, USE_BF16 ? pufferl.param_puf.data : nullptr);
+#else
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
                     pufferl.param_puf.data, pufferl.master_weights.data, n);
             }
+#endif
             if (capturing) {
                 cudaGraph_t _graph;
                 assert(cudaStreamEndCapture(train_stream, &_graph) == cudaSuccess

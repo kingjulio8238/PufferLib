@@ -56,13 +56,19 @@ __global__ void muon_nesterov(float* __restrict__ mb, precision_t* __restrict__ 
 }
 
 // Fused weight update: wb = wb * (1 - lr*wd) - lr * scale * update
+// FUSE_MUON_BF16_CAST: also emit the bf16 param copy here (when bf16_out != null),
+// eliminating the separate full-param cast<<<>>> in the train loop (graph audit #3).
+// Bit-exact: identical fp32 result, same from_float round.
 __global__ void muon_weight_update(float* __restrict__ wb, const precision_t* __restrict__ update,
-        const float* __restrict__ lr_ptr, float wd, float scale, int n) {
+        const float* __restrict__ lr_ptr, float wd, float scale, int n,
+        precision_t* __restrict__ bf16_out = nullptr) {
     float lr = *lr_ptr;
     float wd_scale = 1.0f - lr * wd;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        wb[idx] = wb[idx] * wd_scale - lr * scale * to_float(update[idx]);
+        float v = wb[idx] * wd_scale - lr * scale * to_float(update[idx]);
+        wb[idx] = v;
+        if (bf16_out) bf16_out[idx] = from_float(v);
     }
 }
 
@@ -156,7 +162,8 @@ void muon_post_create(Muon* m) {
     cudaMemset(m->mb_puf.data, 0, numel(m->mb_puf.shape) * sizeof(float));
 }
 
-void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_grad_norm, cudaStream_t stream = 0) {
+void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_grad_norm,
+        cudaStream_t stream = 0, precision_t* bf16_out = nullptr) {
     // Multi-GPU support: simple all-reduce over a contiguous grad buffer
     if (m->nccl_comm != nullptr && m->world_size > 1) {
         ncclAllReduce(grads.data, grads.data, numel(grads.shape),
@@ -227,7 +234,8 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
 #endif  // MUON_SGD_PROBE
 
         muon_weight_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
-            wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne);
+            wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne,
+            bf16_out ? bf16_out + offset : nullptr);
         offset += ne;
     }
 }
