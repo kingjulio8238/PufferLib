@@ -6,6 +6,14 @@
 #include <vector>
 
 #include <time.h>
+// Promoted to DEFAULT-ON (2026-06-16, stack-audit): both bit-exact, measured +3.2%
+// same-session (true ~+1.5-3%, identical gait curve). Opt out with -DNO_... .
+#ifndef NO_FUSE_MUON_BF16_CAST
+#define FUSE_MUON_BF16_CAST 1
+#endif
+#ifndef NO_SKIP_ADV_ZERO
+#define SKIP_ADV_ZERO 1
+#endif
 #include "models.cu"
 #include "ocean.cu"
 #include "muon.cu"
