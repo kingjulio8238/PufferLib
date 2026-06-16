@@ -235,8 +235,10 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
                         src, RC, src, RC, gr, MM, G, stream);
                     cudaMemcpyAsync(grb, gr, (size_t)G * MM * sizeof(precision_t),
                         cudaMemcpyDeviceToDevice, stream);
+                    // serial: puf_addmm_nn(gram, gram, gram_buf, c2, c1) -> out=gram_buf,
+                    // a=gram, b=gram (gram_buf holds the c1*beta base via the memcpy above).
                     cublasGemmStridedBatchedExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)M, (int)M, (int)M,
-                        gr, MM, grb, MM, gr, MM, G, stream, ns_coeffs[i][2], ns_coeffs[i][1]);
+                        gr, MM, gr, MM, grb, MM, G, stream, ns_coeffs[i][2], ns_coeffs[i][1]);
                     cudaMemcpyAsync(dst, src, (size_t)G * RC * sizeof(precision_t),
                         cudaMemcpyDeviceToDevice, stream);
                     cublasGemmStridedBatchedExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
