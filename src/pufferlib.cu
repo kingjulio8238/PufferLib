@@ -299,6 +299,11 @@ typedef struct {
     int minibatch_size;
     float replay_ratio;
     long total_timesteps;
+    // Anneal horizon for LR/entropy/prio cosines, DECOUPLED from run length. 0 =>
+    // use total_timesteps (default). Set > total_timesteps to run a short budget
+    // (e.g. 75M) while annealing on a longer schedule's curve -> the run's endpoint
+    // is the bit-identical checkpoint that a long run would have at that step count.
+    long anneal_timesteps;
     float max_grad_norm;
     // PPO
     float clip_coef;
@@ -1601,7 +1606,9 @@ void train_impl(PuffeRL& pufferl) {
     int current_epoch = pufferl.epoch;
 
     Muon* muon = &pufferl.muon;
-    int total_epochs = hypers.total_timesteps / batch_size;
+    // anneal horizon decoupled from run length (anneal_timesteps); 0 => total_timesteps
+    long anneal_steps = hypers.anneal_timesteps > 0 ? hypers.anneal_timesteps : hypers.total_timesteps;
+    int total_epochs = anneal_steps / batch_size;
     if (anneal_lr) {
         float lr_min = hypers.min_lr_ratio * hypers.lr;
         float lr = cosine_annealing(hypers.lr, lr_min, current_epoch, total_epochs);

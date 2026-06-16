@@ -413,6 +413,9 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.minibatch_size = get_config(train_kwargs, "minibatch_size");
     hypers.replay_ratio = get_config(train_kwargs, "replay_ratio");
     hypers.total_timesteps = get_config(train_kwargs, "total_timesteps");
+    // optional: decouple anneal horizon from run length (0 / absent => total_timesteps)
+    hypers.anneal_timesteps = train_kwargs.contains("anneal_timesteps")
+        ? (long)get_config(train_kwargs, "anneal_timesteps") : 0;
     hypers.max_grad_norm = get_config(train_kwargs, "max_grad_norm");
     // PPO
     hypers.clip_coef = get_config(train_kwargs, "clip_coef");
