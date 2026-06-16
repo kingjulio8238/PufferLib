@@ -218,7 +218,9 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
                                  float* __restrict__ g_act_force) {
     // smem diet: qLD/diag (lane-0 serial solve) and qpos (one actuation read)
     // served from L2; bias folded into smooth. 5.4KB -> 3.5KB per env.
+#ifndef K3_SMEM_DIET   // serve read-only cdof from L2 (-6.7KB -> occupancy; -6.4% measured)
     __shared__ float s_cdof[SWARPS][S_CD];
+#endif
     __shared__ float s_cvel[SWARPS][G1_NBODY * 6];
     __shared__ float s_cacc[SWARPS][G1_NBODY * 6];
     __shared__ float s_cdd[SWARPS][S_CD];
@@ -228,7 +230,11 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
+#ifdef K3_SMEM_DIET
+    const float* cdof = g_cdof + (size_t)e * S_CD;   // L2-served (read-only)
+#else
     float* cdof = s_cdof[warp];
+#endif
     float* cvel = s_cvel[warp];
     float* cacc = s_cacc[warp];
     float* cdd = s_cdd[warp];
@@ -239,7 +245,9 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     float* smoo = s_smooth[warp];
     float* qacc = s_qacc[warp];
 
+#ifndef K3_SMEM_DIET
     for (int k = lane; k < S_CD; k += 32) cdof[k] = g_cdof[(size_t)e * S_CD + k];
+#endif
     for (int k = lane; k < G1_NV; k += 32)
         qvel[k] = g_qvel[(size_t)e * G1_NV + k];
     if (lane == 0) for (int k = 0; k < 6; k++) cvel[k] = 0.0f;
