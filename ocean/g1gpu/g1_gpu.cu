@@ -299,7 +299,18 @@ __global__ void k_epi(int n,
                 + g1e_w_ang_vel_xy * (wx * wx + wy * wy) * upr
                 + g1e_w_orientation * (pg[0] * pg[0] + pg[1] * pg[1]) * upr
                 + g1e_w_torque * t2
+#ifdef N3_AR_UPR_GATE
+                // upr-gate the action-rate penalty (matches w_ang_vel_xy/orientation
+                // above): active when upright (upr~0.9-1 in normal walking) so it
+                // smooths the steady gait, but fades to 0 as the torso tilts toward a
+                // fall (upr->0 by pg.z=-0.75) so it does NOT suppress the large
+                // corrective actions needed for balance/recovery -> no acquisition
+                // fight. Lets w_action_rate be bumped hard enough to cut steady-gait
+                // jerk without collapsing the walk. Pairs with N3_TIMELIMIT_FIX.
+                + g1e_w_action_rate * ar2 * upr;
+#else
                 + g1e_w_action_rate * ar2;
+#endif
 #ifdef G1_TASK_V3
         {
             int tk = g_tick[e];
