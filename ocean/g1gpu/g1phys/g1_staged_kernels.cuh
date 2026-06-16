@@ -653,10 +653,32 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
         int condim = g1c_pair_dim[p];
         for (int k = lane; k < 3 * G1_NV; k += 32) jd[k] = 0.0f;
         __syncwarp();
-        if (lane == 0) {
+        {
             const float* point = cpos + 3 * c;
             float off[3] = {point[0] - com[0], point[1] - com[1], point[2] - com[2]};
             const float* gcd = g_cdof + (size_t)e * S_CD;
+#ifdef K5_PARALLEL
+            // lane-parallel over the body's kinematic chain (last dof + ancestors),
+            // bit-exact; __syncwarp between sides for shared base dofs.
+            for (int side = 0; side < 2; side++) {
+                int body = side == 0 ? b1 : b2;
+                if (body == 0) continue;
+                float sgn = side == 0 ? -1.0f : 1.0f;
+                int last = g1c_body_dofadr[body] + g1c_body_dofnum[body] - 1;
+                int nanc = (last < G1_NV - 1 ? g1c_dof_Madr[last + 1] : G1_NM) - g1c_dof_Madr[last] - 1;
+                int dof = (lane == 0) ? last
+                        : (lane - 1 < nanc ? g1c_dof_chain[last * G1_MAX_CHAIN + (lane - 1)] : -1);
+                if (dof >= 0) {
+                    const float* cd = gcd + 6 * dof;
+                    float t[3]; cross3(t, cd, off);
+                    jd[0 * G1_NV + dof] += sgn * (cd[3] + t[0]);
+                    jd[1 * G1_NV + dof] += sgn * (cd[4] + t[1]);
+                    jd[2 * G1_NV + dof] += sgn * (cd[5] + t[2]);
+                }
+                __syncwarp();
+            }
+#else
+            if (lane == 0)
             for (int side = 0; side < 2; side++) {
                 int body = side == 0 ? b1 : b2;
                 float sgn = side == 0 ? -1.0f : 1.0f;
@@ -672,6 +694,7 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                     i = g1c_dof_parentid[i];
                 }
             }
+#endif
         }
         __syncwarp();
         float fr[9];
