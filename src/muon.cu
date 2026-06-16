@@ -185,6 +185,11 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
         float scale = 1.0f;
 
         // Orthogonalize the update
+        // E1 PROBE (-DMUON_SGD_PROBE): skip the whole Newton-Schulz orthogonalization
+        // (norm kernels + 5 iters × [2 GEMM + 2 copy + 1 addmm]) -> plain SGD update with
+        // the raw grad. Measures Muon's share of the learner FORWARD via the SPS delta
+        // (timing probe; weights are garbage, ignore quality). idiot_learner.md E1.
+#ifndef MUON_SGD_PROBE
         if (ndim(e.shape) >= 2) {
             long R = e.shape[0], C = ne / R;
             long M = min(R, C), N = max(R, C);
@@ -219,6 +224,7 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
             update_ptr = x_buf.data;
             scale = sqrtf(fmaxf(1.0f, (float)R / (float)C));
         }
+#endif  // MUON_SGD_PROBE
 
         muon_weight_update<<<grid_size(ne), BLOCK_SIZE, 0, stream>>>(
             wb_ptr, update_ptr, m->lr_ptr, (float)m->weight_decay, scale, (int)ne);

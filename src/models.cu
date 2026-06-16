@@ -155,7 +155,7 @@ struct PrefixScan {
 // trade is backwards: interval=1 stores every step (no recompute), bit-identical
 // gradients. PROBE (2026-06-16): does killing the recompute speed up the learner?
 #ifndef CHECKPOINT_INTERVAL
-#define CHECKPOINT_INTERVAL 1
+#define CHECKPOINT_INTERVAL 4   // probe (idiot_learner S8): interval=1 was FLAT -> kept 4
 #endif
 __global__ void mingru_scan_forward(PrefixScan scan) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
