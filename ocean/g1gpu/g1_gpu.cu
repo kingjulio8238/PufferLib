@@ -338,7 +338,18 @@ __global__ void k_epi(int n,
         s_fell[warp] = fell;
         s_to[warp] = timeout;
         vec_rew[e] = reward;
+#ifdef N3_TIMELIMIT_FIX
+        // Pardo (2018) time-limit bootstrap: distinguish termination (fall) from
+        // truncation (timeout). 1.0 => true terminal (fall): value bootstrap is
+        // zeroed. 2.0 => truncation (timeout): the advantage must STILL bootstrap
+        // V(s_timeout) instead of zeroing it, while cutting the GAE trace. The env
+        // resets the physics on either (internal `done` at line ~358); this only
+        // changes the terminal signal the trainer reads. REQUIRES the matching
+        // decode in src/pufferlib.cu (compile BOTH with -DN3_TIMELIMIT_FIX).
+        vec_term[e] = fell ? 1.0f : (timeout ? 2.0f : 0.0f);
+#else
         vec_term[e] = done ? 1.0f : 0.0f;
+#endif
         // live episode accumulators (c_step bookkeeping)
         eplog[0] += reward;
         eplog[1] += 1.0f;

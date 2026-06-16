@@ -1252,15 +1252,26 @@ __device__ void puff_advantage_row_scalar(
     float lastpufferlam = 0;
     for (int t = horizon-2; t >= 0; t--) {
         int t_next = t + 1;
-        float nextnonterminal = 1.0f - to_float(dones[t_next]);
         float imp = to_float(importance[t]);
         float rho_t = fminf(imp, rho_clip);
         float c_t = fminf(imp, c_clip);
         float r_nxt = to_float(rewards[t_next]);
         float v = to_float(values[t]);
         float v_nxt = to_float(values[t_next]);
+#ifdef N3_TIMELIMIT_FIX
+        // done-code: 0=alive, 1=fall(terminate), 2=timeout(truncate). On truncation
+        // bootstrap V(s_timeout)=v_nxt (the scan indexes the truncated state at
+        // t_next) but still cut the GAE trace; on a fall, zero both.
+        float dc = to_float(dones[t_next]);
+        float bootstrap_nt = (dc > 0.5f && dc < 1.5f) ? 0.0f : 1.0f;  // 0 only on fall
+        float trace_nt = (dc > 0.5f) ? 0.0f : 1.0f;                   // 0 on fall or timeout
+        float delta = rho_t*r_nxt + gamma*v_nxt*bootstrap_nt - v;
+        lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*trace_nt;
+#else
+        float nextnonterminal = 1.0f - to_float(dones[t_next]);
         float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
+#endif
         advantages[t] = from_float(lastpufferlam);
     }
 }
@@ -1321,11 +1332,22 @@ __device__ __forceinline__ void puff_advantage_row_vec(
 
         #pragma unroll
         for (int i = start_idx; i >= 0; i--) {
-            float nextnonterminal = 1.0f - next_done;
             float rho_t = fminf(imp[i], rho_clip);
             float c_t = fminf(imp[i], c_clip);
+#ifdef N3_TIMELIMIT_FIX
+            // done-code: 0=alive, 1=fall(terminate), 2=timeout(truncate). On
+            // truncation bootstrap V(s_timeout)=next_value (the scan indexes the
+            // truncated state at next_value) but cut the GAE trace; on a fall zero
+            // both. Matches the env sentinel in ocean/g1gpu/g1_gpu.cu.
+            float bootstrap_nt = (next_done > 0.5f && next_done < 1.5f) ? 0.0f : 1.0f;
+            float trace_nt = (next_done > 0.5f) ? 0.0f : 1.0f;
+            float delta = rho_t * (next_reward + gamma * next_value * bootstrap_nt - v[i]);
+            lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * trace_nt;
+#else
+            float nextnonterminal = 1.0f - next_done;
             float delta = rho_t * (next_reward + gamma * next_value * nextnonterminal - v[i]);
             lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
+#endif
             adv[i] = lastpufferlam;
             next_value = v[i];
             next_done = d[i];
