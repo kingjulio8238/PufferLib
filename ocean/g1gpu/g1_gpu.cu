@@ -32,6 +32,16 @@
     exit(1); } } while (0)
 
 #define WARPS_PER_BLOCK 2
+// Promoted to DEFAULT-ON (2026-06-16): K5_PARALLEL (k5 Jacobian-walk lane recovery)
+// + K78_FUSE (k7+k8 fused, H in smem) = +3.4% bit-exact (1.296M->1.340M, 89.3s->86.4s),
+// the standing best at user-approved quality. Opt out for A/B with -DNO_K5_PARALLEL /
+// -DNO_K78_FUSE. (K_NEWTON_FUSE stays opt-IN — it's marginal/shelved.)
+#ifndef NO_K5_PARALLEL
+#define K5_PARALLEL 1
+#endif
+#ifndef NO_K78_FUSE
+#define K78_FUSE 1
+#endif
 #include "g1phys/g1_step.cuh"
 #include "g1phys/g1_full_step.cuh"
 #include "g1phys/g1_staged_kernels.cuh"
