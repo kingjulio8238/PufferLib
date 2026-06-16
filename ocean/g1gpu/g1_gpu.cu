@@ -492,6 +492,10 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     int n = count;
     int blocks = (n + SWARPS - 1) / SWARPS;
     dim3 tpb(32 * SWARPS);
+#if defined(K_NEWTON_FUSE) && !defined(SPARSE_SOLVER)
+    int nf_blocks = (n + SF_WARPS - 1) / SF_WARPS;   // fused Newton kernel: SF_WARPS/block
+    dim3 nf_tpb(32 * SF_WARPS);
+#endif
     size_t s = (size_t)start;
 
 #ifdef G1_CURRICULUM
@@ -594,6 +598,13 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         k6_wsinit<<<blocks, tpb, 0, st>>>(n, qM, qfs, qas, ws, nefc, rowtype, rowdof,
                                           rowsign, D, R, aref, cJ, qaccF, Ma, jaref,
                                           force, state, qfc, scal, hvalid);
+#if defined(K_NEWTON_FUSE) && !defined(SPARSE_SOLVER)   // full Newton loop in one kernel,
+        // H + search/Mv/jv/jaref kept in smem across iters -> no solver round-trips,
+        // 3 fewer launches/iter, and in-register H-reuse (active-set-stable skip).
+        k_newton_iter<<<nf_blocks, nf_tpb, 0, st>>>(n, qM, qfs, qas, nefc, rowtype,
+                                                    rowdof, rowsign, D, R, cJ, qaccF, Ma,
+                                                    jaref, force, state, qfc, scal);
+#else
         for (int it = 0; it < SOL_ITER; it++) {
 #if defined(K78_FUSE) && !defined(SPARSE_SOLVER)   // fused build+factor+solve, H in smem
             k78_solve<<<blocks, tpb, 0, st>>>(n, qM, nefc, rowtype, rowdof, D, state, cJ,
@@ -612,6 +623,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                                                qaccF, Ma, jaref, force, state, qfc,
                                                scal, hvalid);
         }
+#endif
         k4_euler<<<blocks, tpb, 0, st>>>(n, qpos, qvel, qaccF);
         CUDA_CHECK(cudaMemcpyAsync(ws, qaccF, (size_t)n * S_NV * 4,
                                    cudaMemcpyDeviceToDevice, st));

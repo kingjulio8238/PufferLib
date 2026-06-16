@@ -1546,6 +1546,278 @@ __global__ void k10_update(int n, const float* __restrict__ g_qfs,
     }
 }
 
+#if defined(K_NEWTON_FUSE) && !defined(SPARSE_SOLVER)
+// FULL NEWTON-ITERATION FUSION: the entire `for it < SOL_ITER` loop (k7 build+factor,
+// k8 solve+search, k9 linesearch, k10 update) collapsed into ONE persistent kernel.
+// H + search/Mv/jv/jaref/qacc/Ma stay in smem across iterations -> ZERO global
+// round-trips for the dense factor or the per-iter nv/efc vectors, and 3 fewer
+// launches/iter. The big prize is H-REUSE: H = M + sum_quad D J'J depends ONLY on the
+// active-set pattern (M,J,D fixed within a substep), so when no row flips state in k10
+// the smem factor is BIT-IDENTICAL -> we skip rebuild+factor (k7 is ~21% of wall). The
+// active-set-change check is a register flag here, not the global p_hvalid round-trip
+// the per-launch path needed (and that k78_solve had to drop). Bit-exact vs k7..k10:
+// identical math + reduction order, smem instead of global. Behind -DK_NEWTON_FUSE.
+#ifndef SF_WARPS
+#define SF_WARPS 2                  // 2 warps/block measured best on PRO6000 (sm_120):
+#endif                              // gpu_busy 5.003 vs 5.41@4 / 5.05@8 — small blocks win
+                                    // (better SM load-balance/tail; the fat fused kernel
+                                    // is block-shape-sensitive unlike standalone k7)
+__global__ void __launch_bounds__(SF_WARPS * 32) k_newton_iter(
+        int n, const float* __restrict__ g_qM, const float* __restrict__ g_qfs,
+        const float* __restrict__ g_qas, const int* __restrict__ g_nefc,
+        const int* __restrict__ g_rowtype, const int* __restrict__ g_rowdof,
+        const float* __restrict__ g_rowsign, const float* __restrict__ g_D,
+        const float* __restrict__ g_R, const float* __restrict__ g_cJ,
+        float* __restrict__ g_qacc, float* __restrict__ g_Ma,
+        float* __restrict__ g_jaref, float* __restrict__ g_force,
+        int* __restrict__ g_state, float* __restrict__ g_qfc,
+        float* __restrict__ g_scal) {
+    __shared__ float s_H[SF_WARPS][G1_TRI];
+    __shared__ float s_x[SF_WARPS][G1_NV];
+    __shared__ float s_srch[SF_WARPS][G1_NV];
+    __shared__ float s_Mv[SF_WARPS][G1_NV];
+    __shared__ float s_qacc[SF_WARPS][G1_NV];
+    __shared__ float s_Ma[SF_WARPS][G1_NV];
+    __shared__ float s_jv[SF_WARPS][NEFC_MAX];
+    __shared__ float s_jaref[SF_WARPS][NEFC_MAX];
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int e = blockIdx.x * SF_WARPS + warp;
+    if (e >= n) return;
+    float* scal = g_scal + (size_t)e * NSCAL;
+    if (scal[SC_DONE] != 0.0f) return;   // k6 converged (nefc==0): qacc already final
+    const int nv = G1_NV;
+    const float* qM = g_qM + (size_t)e * G1_NM;
+    int nefc = g_nefc[e];
+    const int* rt = g_rowtype + (size_t)e * NEFC_MAX;
+    const int* rd = g_rowdof + (size_t)e * NEFC_MAX;
+    const float* rs = g_rowsign + (size_t)e * NEFC_MAX;
+    const float* D = g_D + (size_t)e * NEFC_MAX;
+    const float* R = g_R + (size_t)e * NEFC_MAX;
+    const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
+    int* state = g_state + (size_t)e * NEFC_MAX;
+    float* force = g_force + (size_t)e * NEFC_MAX;
+    const float* qfs = g_qfs + (size_t)e * nv;
+    const float* qas = g_qas + (size_t)e * nv;
+    float* qfc = g_qfc + (size_t)e * nv;       // updated each iter (jt_force)
+    float* H = s_H[warp];
+    float* x = s_x[warp]; float* srch = s_srch[warp]; float* Mv = s_Mv[warp];
+    float* qacc = s_qacc[warp]; float* Ma = s_Ma[warp];
+    float* jv = s_jv[warp]; float* jaref = s_jaref[warp];
+
+    // pull k6's warmstart init into smem (Ma, qacc, jaref); cost/gauss stay in scal
+    for (int i = lane; i < nv; i += 32) {
+        qacc[i] = g_qacc[(size_t)e * nv + i];
+        Ma[i] = g_Ma[(size_t)e * nv + i];
+    }
+    for (int r = lane; r < nefc; r += 32) jaref[r] = g_jaref[(size_t)e * NEFC_MAX + r];
+    __syncwarp();
+    // cost/gauss are loop-carried scalars (uniform across the warp via reductions);
+    // keep them in registers instead of round-tripping scal[] global between iters
+    // (the per-launch path relied on the kernel boundary for that ordering).
+    float cost_carry = scal[SC_COST], gauss_carry = scal[SC_GAUSS];
+
+    int need_build = 1;   // iter 0 always builds; later iters skip when active set stable
+    for (int it = 0; it < SOL_ITER; it++) {
+        // ---- k7: build H = M + jointdiag + J'DJ, then LLT factor (only if needed) ----
+        if (need_build) {
+            for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
+            __syncwarp();
+            for (int i = lane; i < nv; i += 32) {
+                int adr = g1c_dof_Madr[i];
+                H[tridx(i, i)] = qM[adr++];
+                for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                    H[tridx(i, j)] = qM[adr++];
+            }
+            __syncwarp();
+            for (int r = lane; r < nefc; r += 32) {
+                if (state[r] != ST_QUAD || rt[r] == ROW_CONTACT) continue;
+                atomicAdd(&H[tridx(rd[r], rd[r])], D[r]);
+            }
+            __syncwarp();
+            for (int r = 0; r < nefc; r++) {
+                if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
+                float Dr = D[r];
+                const float* J = cJ + rd[r] * G1_NV;
+                for (int i = lane; i < nv; i += 32) {
+                    float Ji = J[i];
+                    if (Ji == 0.0f) continue;
+                    float DJi = Dr * Ji;
+                    for (int j = 0; j <= i; j++) H[tridx(i, j)] += DJi * J[j];
+                }
+            }
+            __syncwarp();
+            for (int k = 0; k < nv; k++) {
+                if (lane == 0) H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
+                __syncwarp();
+                float invd = 1.0f / H[tridx(k, k)];
+                for (int i = k + 1 + lane; i < nv; i += 32) H[tridx(i, k)] *= invd;
+                __syncwarp();
+                for (int i = k + 1 + lane; i < nv; i += 32) {
+                    float Lik = H[tridx(i, k)];
+                    for (int j = k + 1; j <= i; j++) H[tridx(i, j)] -= Lik * H[tridx(j, k)];
+                }
+                __syncwarp();
+            }
+        }
+        // ---- k8: solve x = (LL')^-1 (Ma - qfs - qfc); search = -x; Mv, jv, qg ----
+        for (int i = lane; i < nv; i += 32) x[i] = Ma[i] - qfs[i] - qfc[i];
+        __syncwarp();
+        for (int j = 0; j < nv; j++) {
+            if (lane == 0) x[j] /= H[tridx(j, j)];
+            __syncwarp();
+            float xj = x[j];
+            for (int i = j + 1 + lane; i < nv; i += 32) x[i] -= H[tridx(i, j)] * xj;
+            __syncwarp();
+        }
+        for (int j = nv - 1; j >= 0; j--) {
+            if (lane == 0) x[j] /= H[tridx(j, j)];
+            __syncwarp();
+            float xj = x[j];
+            for (int i = lane; i < j; i += 32) x[i] -= H[tridx(j, i)] * xj;
+            __syncwarp();
+        }
+        for (int i = lane; i < nv; i += 32) srch[i] = -x[i];
+        __syncwarp();
+        mul_M_vec_g(qM, srch, Mv, lane);
+        float snorm = 0.0f, qg1 = 0.0f, qg2 = 0.0f;
+        for (int i = lane; i < nv; i += 32) {
+            snorm += srch[i] * srch[i];
+            qg1 += srch[i] * Ma[i] - qfs[i] * srch[i];
+            qg2 += 0.5f * srch[i] * Mv[i];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            snorm += __shfl_xor_sync(0xffffffff, snorm, o);
+            qg1 += __shfl_xor_sync(0xffffffff, qg1, o);
+            qg2 += __shfl_xor_sync(0xffffffff, qg2, o);
+        }
+        float qg0 = gauss_carry;
+        snorm = sqrtf(snorm);
+        for (int r = lane; r < nefc; r += 32)
+            jv[r] = row_dot_g(rt[r], rd[r], rs[r], cJ, srch);
+        __syncwarp();
+        // ---- k9: exact PrimalSearch linesearch -> alpha (jaref/jv from smem) ----
+        float alpha;
+        if (snorm < 1e-15f) {
+            alpha = 0.0f;
+        } else {
+            float scale = 1.0f / (g1c_meaninertia * (float)G1_NV);
+            float gtol = SOL_TOL * SOL_LS_TOL * snorm / scale;
+#define EVF(a, c, d0v, d1v) staged_eval(nefc, rt, rd, D, R, jaref, jv, qg0, qg1, qg2, a, c, d0v, d1v)
+            float a_p0 = 0.0f, c_p0, d0_p0, d1_p0;
+            EVF(a_p0, &c_p0, &d0_p0, &d1_p0);
+            int ls_iter = 1;
+            float a_p1 = a_p0 - d0_p0 / d1_p0, c_p1, d0_p1, d1_p1;
+            EVF(a_p1, &c_p1, &d0_p1, &d1_p1);
+            ls_iter++;
+            alpha = 0.0f;
+            int done = 0;
+            if (fabsf(d0_p1) < gtol) { alpha = a_p1; done = 1; }
+            if (!done) {
+                int dir = d0_p1 < 0.0f ? 1 : -1;
+                float a_p2 = a_p0, c_p2 = c_p0, d0_p2 = d0_p0, d1_p2 = d1_p0;
+                while (d0_p1 * dir <= -gtol && ls_iter < SOL_LS_ITER) {
+                    a_p2 = a_p1; c_p2 = c_p1; d0_p2 = d0_p1; d1_p2 = d1_p1;
+                    a_p1 = a_p1 - d0_p1 / d1_p1;
+                    EVF(a_p1, &c_p1, &d0_p1, &d1_p1);
+                    ls_iter++;
+                    if (fabsf(d0_p1) < gtol) { alpha = a_p1; done = 1; break; }
+                }
+                if (!done && ls_iter >= SOL_LS_ITER) { alpha = a_p1; done = 1; }
+                if (!done) {
+                    float a_n1, c_n1, d0_n1, d1_n1;
+                    float a_n2 = a_p1, c_n2 = c_p1, d0_n2 = d0_p1, d1_n2 = d1_p1;
+                    a_n1 = a_p1 - d0_p1 / d1_p1;
+                    EVF(a_n1, &c_n1, &d0_n1, &d1_n1);
+                    ls_iter++;
+                    while (!done && ls_iter < SOL_LS_ITER) {
+                        float a_m = 0.5f * (a_p1 + a_p2), c_m, d0_m, d1_m;
+                        EVF(a_m, &c_m, &d0_m, &d1_m);
+                        ls_iter++;
+                        float ca[3] = {a_n1, a_n2, a_m}, cc[3] = {c_n1, c_n2, c_m};
+                        float cd0[3] = {d0_n1, d0_n2, d0_m}, cd1[3] = {d1_n1, d1_n2, d1_m};
+                        int best = -1;
+                        for (int q = 0; q < 3; q++)
+                            if (fabsf(cd0[q]) < gtol && (best == -1 || cc[q] < cc[best])) best = q;
+                        if (best >= 0) { alpha = ca[best]; done = 1; break; }
+                        int b1 = 0, b2 = 0;
+                        for (int q = 0; q < 3; q++) {
+                            if (d0_p1 < 0 && cd0[q] < 0 && d0_p1 < cd0[q]) {
+                                a_p1 = ca[q]; c_p1 = cc[q]; d0_p1 = cd0[q]; d1_p1 = cd1[q]; b1 = 1;
+                            } else if (d0_p1 > 0 && cd0[q] > 0 && d0_p1 > cd0[q]) {
+                                a_p1 = ca[q]; c_p1 = cc[q]; d0_p1 = cd0[q]; d1_p1 = cd1[q]; b1 = 2;
+                            }
+                        }
+                        if (b1) {
+                            a_n1 = a_p1 - d0_p1 / d1_p1;
+                            EVF(a_n1, &c_n1, &d0_n1, &d1_n1);
+                            ls_iter++;
+                        }
+                        for (int q = 0; q < 3; q++) {
+                            if (d0_p2 < 0 && cd0[q] < 0 && d0_p2 < cd0[q]) {
+                                a_p2 = ca[q]; c_p2 = cc[q]; d0_p2 = cd0[q]; d1_p2 = cd1[q]; b2 = 1;
+                            } else if (d0_p2 > 0 && cd0[q] > 0 && d0_p2 > cd0[q]) {
+                                a_p2 = ca[q]; c_p2 = cc[q]; d0_p2 = cd0[q]; d1_p2 = cd1[q]; b2 = 2;
+                            }
+                        }
+                        if (b2) {
+                            a_n2 = a_p2 - d0_p2 / d1_p2;
+                            EVF(a_n2, &c_n2, &d0_n2, &d1_n2);
+                            ls_iter++;
+                        }
+                        if (!b1 && !b2) { alpha = a_m; done = 1; break; }
+                    }
+                    if (!done) {
+                        if (c_p1 <= c_p2 && c_p1 < c_p0) alpha = a_p1;
+                        else if (c_p2 <= c_p1 && c_p2 < c_p0) alpha = a_p2;
+                        else alpha = 0.0f;
+                    }
+                }
+            }
+#undef EVF
+        }
+        // ---- k10: move + constraint update + qfc + gauss + termination ----
+        if (alpha == 0.0f) { if (lane == 0) scal[SC_DONE] = 1.0f; break; }
+        for (int i = lane; i < nv; i += 32) {
+            qacc[i] += alpha * srch[i];
+            Ma[i] += alpha * Mv[i];
+        }
+        for (int r = lane; r < nefc; r += 32) jaref[r] += alpha * jv[r];
+        __syncwarp();
+        int changed = 0;
+        float cost = constraint_update_g(nefc, rt, rd, D, R, jaref, force, state, lane, &changed);
+        jt_force_g(nefc, rt, rd, rs, cJ, force, qfc, lane);
+        float gauss = 0.0f, gn = 0.0f;
+        for (int i = lane; i < nv; i += 32) {
+            float ma = Ma[i];
+            float qf = qfs[i];
+            gauss += 0.5f * (ma - qf) * (qacc[i] - qas[i]);
+            float gi = ma - qf - qfc[i];
+            gn += gi * gi;
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            gauss += __shfl_xor_sync(0xffffffff, gauss, o);
+            gn += __shfl_xor_sync(0xffffffff, gn, o);
+        }
+        float newcost = cost + gauss;
+        float scale = 1.0f / (g1c_meaninertia * (float)nv);
+        float improvement = scale * (cost_carry - newcost);
+        float gradient = scale * sqrtf(gn);
+        cost_carry = newcost;
+        gauss_carry = gauss;
+        int conv = (improvement < SOL_TOL || gradient < SOL_TOL);
+        if (conv) { if (lane == 0) scal[SC_DONE] = 1.0f; break; }
+        need_build = changed;   // H-REUSE: rebuild+factor next iter only if a row flipped
+    }
+    // write final state back to global (qaccF integrated downstream by k4_euler)
+    for (int i = lane; i < nv; i += 32) {
+        g_qacc[(size_t)e * nv + i] = qacc[i];
+        g_Ma[(size_t)e * nv + i] = Ma[i];
+    }
+    for (int r = lane; r < nefc; r += 32) g_jaref[(size_t)e * NEFC_MAX + r] = jaref[r];
+    if (lane == 0) { scal[SC_COST] = cost_carry; scal[SC_GAUSS] = gauss_carry; }
+}
+#endif
+
 // expand sparse qM to dense for the host compare
 __global__ void k_expand_qM(int n, const float* __restrict__ g_qM,
                             float* __restrict__ g_qMd) {
