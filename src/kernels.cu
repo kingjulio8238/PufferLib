@@ -273,6 +273,23 @@ static inline void cublasGemmExDense(
         C, CUBLAS_PRECISION, N, CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
 }
 
+// Strided-batched dense GEMM (mirrors cublasGemmExDense's row-major transpose trick;
+// strides are in ELEMENTS). Used by MUON_BATCHED_NS to run the Newton-Schulz of the
+// 3 identical contiguous MinGRU weight matrices as one batch.
+static inline void cublasGemmStridedBatchedExDense(
+        cublasOperation_t op_a, cublasOperation_t op_b, int M, int N, int K,
+        void* A, long strideA, void* B, long strideB, void* C, long strideC,
+        int batchCount, cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
+    int lda = (op_a == CUBLAS_OP_N) ? K : M;
+    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
+    cublasHandle_t handle = cublas_get_handle();
+    cublasSetStream(handle, stream);
+    cublasGemmStridedBatchedEx(handle, op_b, op_a, N, M, K, &alpha,
+        B, CUBLAS_PRECISION, ldb, strideB, A, CUBLAS_PRECISION, lda, strideA, &beta,
+        C, CUBLAS_PRECISION, N, strideC, batchCount,
+        CUBLAS_COMPUTE_PRECISION, CUBLAS_GEMM_DEFAULT);
+}
+
 // out(...,N) = a(...,K) @ b(N,K)^T  — leading dims folded into M
 void puf_mm(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
     int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];

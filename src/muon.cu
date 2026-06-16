@@ -81,6 +81,10 @@ __global__ void muon_clip_norm(precision_t* __restrict__ dst,
     }
 }
 
+#ifdef MUON_BATCHED_NS
+#define MAX_NS_BATCH 4   // upper bound on a contiguous same-shape weight-matrix group
+#endif
+
 static constexpr double ns_coeffs[5][3] = {
     {4.0848, -6.8946, 2.9270},
     {3.9505, -6.3029, 2.6377},
@@ -141,9 +145,16 @@ void muon_init(Muon* m, Allocator* param_alloc, double lr_val,
     }
     if (max_M > 0) {
         m->max_M = max_M; m->max_N = max_N;
-        m->gram =        {.shape = {max_M, max_M}};
-        m->gram_buf =    {.shape = {max_M, max_M}};
-        m->x_buf =       {.shape = {max_M, max_N}};
+#ifdef MUON_BATCHED_NS
+        // scratch holds up to MAX_NS_BATCH matrices' Newton-Schulz buffers so the
+        // contiguous same-shape group (3 MinGRU mats) can run as one strided batch.
+        const long NB = MAX_NS_BATCH;
+#else
+        const long NB = 1;
+#endif
+        m->gram =        {.shape = {NB * max_M, max_M}};
+        m->gram_buf =    {.shape = {NB * max_M, max_M}};
+        m->x_buf =       {.shape = {NB * max_M, max_N}};
         m->ns_norm_puf = {.shape = {1}};
         alloc_register(alloc, &m->gram);
         alloc_register(alloc, &m->gram_buf);
@@ -190,6 +201,58 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
         long ne = numel(e.shape);
         const precision_t* update_ptr = gc_ptr;
         float scale = 1.0f;
+
+#ifdef MUON_BATCHED_NS
+        // Batch the Newton-Schulz of a run of consecutive identical-shape 2D weight
+        // matrices (the 3 MinGRU {3H,H} mats, contiguous in the flat buffer) into ONE
+        // strided batch -> collapses 3 serial ~28-kernel chains to 1. Algorithmically
+        // equivalent (StridedBatched may differ in accum order from per-mat GemmEx ->
+        // NOT bit-identical; gait A/B gates it). idiot_learner.md / muon-auditor design.
+        if (ndim(e.shape) >= 2) {
+            int G = 1;
+            while (_i + G < m->param_alloc->num_regs &&
+                   ndim(m->param_alloc->regs[_i + G].shape) >= 2 &&
+                   m->param_alloc->regs[_i + G].shape[0] == e.shape[0] &&
+                   numel(m->param_alloc->regs[_i + G].shape) == ne &&
+                   G < MAX_NS_BATCH) G++;
+            if (G > 1) {
+                long R = e.shape[0], C = ne / R, M = min(R, C), N = max(R, C);
+                bool tall = R > C; long RC = R * C, MM = M * M;
+                precision_t* xb = m->x_buf.data, *gr = m->gram.data, *grb = m->gram_buf.data;
+                for (int g = 0; g < G; g++) {       // per-matrix RMS-normalize (serial, cheap)
+                    precision_t* xg = gc_ptr + (long)g * RC;
+                    int nb = min((int)grid_size(RC), 256);
+                    muon_norm_partials<<<nb, 256, 0, stream>>>(m->norm_partials.data, xg, RC);
+                    muon_norm_reduce<<<1, 256, 0, stream>>>(m->norm_ptr, m->norm_partials.data, nb);
+                    muon_norm_apply<<<grid_size(RC), BLOCK_SIZE, 0, stream>>>(xg, m->norm_ptr, 1e-7f, RC);
+                }
+                cublasOperation_t ga = tall ? CUBLAS_OP_T : CUBLAS_OP_N;
+                cublasOperation_t gb = tall ? CUBLAS_OP_N : CUBLAS_OP_T;
+                for (int i = 0; i < 5; ++i) {
+                    precision_t* src = (i % 2 == 0) ? gc_ptr : xb;
+                    precision_t* dst = (i % 2 == 0) ? xb : gc_ptr;
+                    cublasGemmStridedBatchedExDense(ga, gb, (int)M, (int)M, (int)N,
+                        src, RC, src, RC, gr, MM, G, stream);
+                    cudaMemcpyAsync(grb, gr, (size_t)G * MM * sizeof(precision_t),
+                        cudaMemcpyDeviceToDevice, stream);
+                    cublasGemmStridedBatchedExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)M, (int)M, (int)M,
+                        gr, MM, grb, MM, gr, MM, G, stream, ns_coeffs[i][2], ns_coeffs[i][1]);
+                    cudaMemcpyAsync(dst, src, (size_t)G * RC * sizeof(precision_t),
+                        cudaMemcpyDeviceToDevice, stream);
+                    cublasGemmStridedBatchedExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
+                        tall ? src : grb, tall ? RC : MM, tall ? grb : src, tall ? MM : RC,
+                        dst, RC, G, stream, 1.0f, ns_coeffs[i][0]);
+                }
+                float bscale = sqrtf(fmaxf(1.0f, (float)R / (float)C));  // result in xb (i=4 even)
+                muon_weight_update<<<grid_size(G * ne), BLOCK_SIZE, 0, stream>>>(
+                    wb_ptr, xb, m->lr_ptr, (float)m->weight_decay, bscale, (int)(G * ne),
+                    bf16_out ? bf16_out + offset : nullptr);
+                offset += (long)G * ne;
+                _i += G - 1;
+                continue;
+            }
+        }
+#endif
 
         // Orthogonalize the update
         // E1 PROBE (-DMUON_SGD_PROBE): skip the whole Newton-Schulz orthogonalization
