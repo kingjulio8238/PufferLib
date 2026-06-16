@@ -1074,8 +1074,10 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
         }
         __syncwarp();
     }
+#ifndef K7_NO_HWRITE     // probe: skip H->global write (simulate fusing H into smem; SPS-only)
     for (int k = lane; k < G1_TRI; k += 32)
         g_H[(size_t)e * (size_t)G1_TRI + k] = H[k];
+#endif
     if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
 #endif  // SPARSE_SOLVER (dense path)
 }
@@ -1145,8 +1147,10 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
     }
 #else
     float* L = s_L[warp];
+#ifndef K8_NO_HLOAD      // probe: skip H<-global read (simulate fusing H from smem; SPS-only)
     for (int k = lane; k < G1_TRI; k += 32)
         L[k] = g_H[(size_t)e * (size_t)G1_TRI + k];
+#endif
     __syncwarp();
     // x <- (L L')^-1 x, column sweeps
     for (int j = 0; j < nv; j++) {
