@@ -148,8 +148,15 @@ struct PrefixScan {
     PrecisionTensor grad_input;        // (B, T, H) highway gate gradient w.r.t. input
 };
 
-// Checkpointing trades off partial recomputation for memory bandwidth.
-#define CHECKPOINT_INTERVAL 4
+// Checkpointing trades partial recomputation (backward) for fewer forward writes.
+// NOTE: the buffer (a_star/s/log_values) is FULL-sized (3*bH*T_seq) regardless of
+// interval — checkpointing saves NO memory here, only forward write bandwidth, at
+// the cost of a sequential scan recompute in the backward. With ~93GB free VRAM the
+// trade is backwards: interval=1 stores every step (no recompute), bit-identical
+// gradients. PROBE (2026-06-16): does killing the recompute speed up the learner?
+#ifndef CHECKPOINT_INTERVAL
+#define CHECKPOINT_INTERVAL 1
+#endif
 __global__ void mingru_scan_forward(PrefixScan scan) {
     int T_seq = scan.T, H = scan.H, B = scan.B;
     precision_t* __restrict__ out = scan.out.data;
