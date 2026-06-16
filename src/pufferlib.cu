@@ -1557,6 +1557,83 @@ void train_impl(PuffeRL& pufferl) {
 
     int total_minibatches = hypers.replay_ratio * batch_size / hypers.minibatch_size;
     for (int mb = 0; mb < total_minibatches; ++mb) {
+#ifdef GRAPH_FULL_MB_BODY
+        // Capture the ENTIRE minibatch body (MISC advantage/prio/select_copy + fwd/bwd/
+        // muon/cast + index_copy writeback) into ONE graph, replay it 48x/epoch -> kills
+        // the ~11 eager launches/mb (several <<<1,1>>>) the train phase exposes (NOT
+        // multi-buffer-hidden). Bit-exact: graph replays identical kernels; device state
+        // (RNG offset, in-place ratio/value writeback, weights) evolves across replays.
+        // Disabled under --profile (the granular MISC/FWD event split needs eager launches).
+        // Assumes the fused-bf16 muon path (bf16_out) -> no separate cast in-graph.
+        if (!hypers.profile) {
+            if (pufferl.train_captured) {
+                cudaGraphLaunch(pufferl.train_cudagraph, train_stream);
+                continue;
+            }
+            bool fb_capturing = (pufferl.train_warmup == hypers.cudagraphs);
+            if (fb_capturing)
+                cudaStreamBeginCapture(train_stream, cudaStreamCaptureModeGlobal);
+            cudaStream_t s = train_stream;
+#ifdef SKIP_ADV_ZERO
+            if (hypers.horizon % (16 / (int)sizeof(precision_t)) != 0)
+#endif
+            puf_zero(&advantages_puf, s);
+            puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
+                rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
+                hypers.vtrace_rho_clip, hypers.vtrace_c_clip, s);
+            if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL)
+                zero_frozen_advantages_cuda(advantages_puf,
+                    hypers.total_agents / hypers.num_buffers, pufferl.bank_layout[1], s);
+            long* fb_rng = pufferl.rng_offset_puf.data + hypers.num_buffers;
+            prio_replay_cuda(advantages_puf, prio_alpha, minibatch_segments,
+                hypers.total_agents, anneal_beta, pufferl.prio_bufs, pufferl.seed, fb_rng, s);
+            if (hypers.reset_state) puf_zero(&graph.mb_state, s);
+            {
+                RolloutBuf sel_src = rollouts;
+                int mb_segs = pufferl.prio_bufs.idx.shape[0];
+                int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+                select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, s>>>(
+                    sel_src, graph, pufferl.prio_bufs.idx.data,
+                    advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
+            }
+            PrecisionTensor fb_obs = graph.mb_obs, fb_state = graph.mb_state;
+            PrecisionTensor fb_dec = policy_forward_train(&pufferl.policy, pufferl.weights,
+                pufferl.train_activations, fb_obs, fb_state, s);
+            DecoderWeights* fb_dw = (DecoderWeights*)pufferl.weights.decoder;
+            PrecisionTensor fb_logstd;
+            if (fb_dw->continuous) fb_logstd = fb_dw->logstd;
+            ppo_loss_fwd_bwd(fb_dec, fb_logstd, graph, pufferl.act_sizes_puf, pufferl.losses_puf,
+                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, current_ent_coef,
+                pufferl.ppo_bufs_puf, pufferl.is_continuous, s);
+            policy_backward(&pufferl.policy, pufferl.weights, pufferl.train_activations,
+                pufferl.ppo_bufs_puf.grad_logits,
+                pufferl.is_continuous ? pufferl.ppo_bufs_puf.grad_logstd : FloatTensor(),
+                pufferl.ppo_bufs_puf.grad_values, s);
+            muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf,
+                hypers.max_grad_norm, s, USE_BF16 ? pufferl.param_puf.data : nullptr);
+            {
+                int num_idx = numel(pufferl.prio_bufs.idx.shape);
+                int rb1 = (numel(graph.mb_ratio.shape) / graph.mb_ratio.shape[0]) * sizeof(precision_t);
+                index_copy<<<grid_size(num_idx), BLOCK_SIZE, 0, s>>>(
+                    (char*)rollouts.ratio.data, pufferl.prio_bufs.idx.data,
+                    (const char*)graph.mb_ratio.data, num_idx, rb1);
+                int rb2 = graph.mb_newvalue.shape[1] * sizeof(precision_t);
+                index_copy<<<grid_size(num_idx), BLOCK_SIZE, 0, s>>>(
+                    (char*)rollouts.values.data, pufferl.prio_bufs.idx.data,
+                    (const char*)graph.mb_newvalue.data, num_idx, rb2);
+            }
+            if (fb_capturing) {
+                cudaGraph_t _g;
+                cudaStreamEndCapture(train_stream, &_g);
+                cudaGraphInstantiate(&pufferl.train_cudagraph, _g, 0);
+                cudaGraphDestroy(_g);
+                cudaDeviceSynchronize();
+                pufferl.train_captured = true;
+            }
+            pufferl.train_warmup++;
+            continue;
+        }
+#endif
         cudaEventRecord(pufferl.profile.events[2]);  // start of misc (overwritten each iter)
 #ifdef SKIP_ADV_ZERO
         // graph audit #2: the vectorized advantage path (puff_advantage_row_vec) writes
