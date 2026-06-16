@@ -595,11 +595,16 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                                           rowsign, D, R, aref, cJ, qaccF, Ma, jaref,
                                           force, state, qfc, scal, hvalid);
         for (int it = 0; it < SOL_ITER; it++) {
+#if defined(K78_FUSE) && !defined(SPARSE_SOLVER)   // fused build+factor+solve, H in smem
+            k78_solve<<<blocks, tpb, 0, st>>>(n, qM, nefc, rowtype, rowdof, D, state, cJ,
+                                              qfs, Ma, qfc, rowsign, search, Mv, jv, scal);
+#else
             k7_hessian<<<blocks, tpb, 0, st>>>(n, qM, nefc, rowtype, rowdof, D,
                                                state, cJ, scal, H, hvalid);
             k8_solvesearch<<<blocks, tpb, 0, st>>>(n, qM, qfs, Ma, qfc, H, nefc,
                                                    rowtype, rowdof, rowsign, cJ,
                                                    search, Mv, jv, scal);
+#endif
             k9_linesearch<<<blocks, tpb, 0, st>>>(n, nefc, rowtype, rowdof, D, R,
                                                   jaref, jv, scal);
             k10_update<<<blocks, tpb, 0, st>>>(n, qfs, qas, nefc, rowtype, rowdof,

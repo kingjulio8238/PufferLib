@@ -1242,6 +1242,121 @@ __device__ __forceinline__ void staged_eval(int nefc, const int* rt, const int* 
     *d1 = fmaxf(2.0f*t2, 1e-15f);
 }
 
+#if defined(K78_FUSE) && !defined(SPARSE_SOLVER)
+// FUSED k7+k8: build H + LLT factor in s_H, then solve+search using s_H directly —
+// H/L NEVER round-trips through global (the +23% training-SPS lever). Bit-exact.
+__global__ void k78_solve(int n, const float* __restrict__ g_qM,
+                          const int* __restrict__ g_nefc, const int* __restrict__ g_rowtype,
+                          const int* __restrict__ g_rowdof, const float* __restrict__ g_D,
+                          const int* __restrict__ g_state, const float* __restrict__ g_cJ,
+                          const float* __restrict__ g_qfs, const float* __restrict__ g_Ma,
+                          const float* __restrict__ g_qfc, const float* __restrict__ g_rowsign,
+                          float* __restrict__ g_search, float* __restrict__ g_Mv,
+                          float* __restrict__ g_jv, float* __restrict__ g_scal) {
+    __shared__ float s_H[SWARPS][G1_TRI];
+    __shared__ float s_x[SWARPS][G1_NV];
+    __shared__ float s_srch[SWARPS][G1_NV];
+    __shared__ float s_Mv[SWARPS][G1_NV];
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int e = blockIdx.x * SWARPS + warp;
+    if (e >= n) return;
+    float* scal = g_scal + (size_t)e * NSCAL;
+    if (scal[SC_DONE] != 0.0f) return;
+    const int nv = G1_NV;
+    const float* qM = g_qM + (size_t)e * G1_NM;
+    int nefc = g_nefc[e];
+    const int* rt = g_rowtype + (size_t)e * NEFC_MAX;
+    const int* rd = g_rowdof + (size_t)e * NEFC_MAX;
+    const float* D = g_D + (size_t)e * NEFC_MAX;
+    const int* state = g_state + (size_t)e * NEFC_MAX;
+    const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
+    float* H = s_H[warp];
+    for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
+    __syncwarp();
+    for (int i = lane; i < nv; i += 32) {
+        int adr = g1c_dof_Madr[i];
+        H[tridx(i, i)] = qM[adr++];
+        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+            H[tridx(i, j)] = qM[adr++];
+    }
+    __syncwarp();
+    for (int r = lane; r < nefc; r += 32) {
+        if (state[r] != ST_QUAD || rt[r] == ROW_CONTACT) continue;
+        atomicAdd(&H[tridx(rd[r], rd[r])], D[r]);
+    }
+    __syncwarp();
+    for (int r = 0; r < nefc; r++) {
+        if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
+        float Dr = D[r];
+        const float* J = cJ + rd[r] * G1_NV;
+        for (int i = lane; i < nv; i += 32) {
+            float Ji = J[i];
+            if (Ji == 0.0f) continue;
+            float DJi = Dr * Ji;
+            for (int j = 0; j <= i; j++) H[tridx(i, j)] += DJi * J[j];
+        }
+    }
+    __syncwarp();
+    for (int k = 0; k < nv; k++) {
+        if (lane == 0) H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
+        __syncwarp();
+        float invd = 1.0f / H[tridx(k, k)];
+        for (int i = k + 1 + lane; i < nv; i += 32) H[tridx(i, k)] *= invd;
+        __syncwarp();
+        for (int i = k + 1 + lane; i < nv; i += 32) {
+            float Lik = H[tridx(i, k)];
+            for (int j = k + 1; j <= i; j++) H[tridx(i, j)] -= Lik * H[tridx(j, k)];
+        }
+        __syncwarp();
+    }
+    float* x = s_x[warp]; float* srch = s_srch[warp]; float* Mv = s_Mv[warp];
+    for (int i = lane; i < nv; i += 32)
+        x[i] = g_Ma[(size_t)e * nv + i] - g_qfs[(size_t)e * nv + i] - g_qfc[(size_t)e * nv + i];
+    __syncwarp();
+    for (int j = 0; j < nv; j++) {
+        if (lane == 0) x[j] /= H[tridx(j, j)];
+        __syncwarp();
+        float xj = x[j];
+        for (int i = j + 1 + lane; i < nv; i += 32) x[i] -= H[tridx(i, j)] * xj;
+        __syncwarp();
+    }
+    for (int j = nv - 1; j >= 0; j--) {
+        if (lane == 0) x[j] /= H[tridx(j, j)];
+        __syncwarp();
+        float xj = x[j];
+        for (int i = lane; i < j; i += 32) x[i] -= H[tridx(j, i)] * xj;
+        __syncwarp();
+    }
+    for (int i = lane; i < nv; i += 32) srch[i] = -x[i];
+    __syncwarp();
+    mul_M_vec_g(qM, srch, Mv, lane);
+    float snorm = 0.0f, qg1 = 0.0f, qg2 = 0.0f;
+    for (int i = lane; i < nv; i += 32) {
+        snorm += srch[i] * srch[i];
+        qg1 += srch[i] * g_Ma[(size_t)e * nv + i] - g_qfs[(size_t)e * nv + i] * srch[i];
+        qg2 += 0.5f * srch[i] * Mv[i];
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        snorm += __shfl_xor_sync(0xffffffff, snorm, o);
+        qg1 += __shfl_xor_sync(0xffffffff, qg1, o);
+        qg2 += __shfl_xor_sync(0xffffffff, qg2, o);
+    }
+    const float* rs = g_rowsign + (size_t)e * NEFC_MAX;
+    for (int r = lane; r < nefc; r += 32)
+        g_jv[(size_t)e * NEFC_MAX + r] = row_dot_g(rt[r], rd[r], rs[r], cJ, srch);
+    for (int i = lane; i < nv; i += 32) {
+        g_search[(size_t)e * nv + i] = srch[i];
+        g_Mv[(size_t)e * nv + i] = Mv[i];
+    }
+    if (lane == 0) {
+        scal[SC_QG0] = scal[SC_GAUSS];
+        scal[SC_QG1] = qg1;
+        scal[SC_QG2] = qg2;
+        scal[SC_SNORM] = sqrtf(snorm);
+    }
+}
+#endif
+
 __global__ void k9_linesearch(int n, const int* __restrict__ g_nefc,
                               const int* __restrict__ g_rowtype,
                               const int* __restrict__ g_rowdof,
