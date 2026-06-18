@@ -92,6 +92,12 @@ __device__ float g1e_cmd_scale = 1.0f;
 // docs/sim2real.md (D4) for the reference ranges.
 // ---------------------------------------------------------------------------
 __device__ int   g1e_dr_enable = 0;        // 0 = OFF (bit-exact baseline)
+// DR curriculum scale: multiplies ALL DR magnitudes (noise/push/init/friction/mass
+// deviation). 1.0 = full DR (default, non-curriculum). Under -DG1_DR_CURRICULUM the
+// host ramps it 0->1 (warmup at 0 so the forward gait forms clean, then DR fades in)
+// — avoids the full-DR-from-step-0 degenerate basin. friction/mass interpolate toward
+// 1.0: scale = 1 + dr_scale*(sampled-1).
+__device__ float g1e_dr_scale = 1.0f;
 // observation noise (actor-only; uniform U[-1,1]*scale added per channel group).
 // These are OBS-SPACE scales — added AFTER the obs scaling, i.e. the EFFECTIVE
 // per-element noise, NOT physical units. They equal (unitree physical noise x the
@@ -205,15 +211,19 @@ __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
         // when DR off -> no extra RNG draws -> bit-exact baseline).
         if (g1e_dr_enable && g1e_init_basevel > 0.0f) {
             for (int k = 0; k < 6; k++)
-                g_qvel[(size_t)e * S_NV + k] = g1e_init_basevel * urand_pm1(&rng);
+                g_qvel[(size_t)e * S_NV + k] = g1e_dr_scale * g1e_init_basevel * urand_pm1(&rng);
         }
         // DR per-env friction & mass scale (resampled each reset; read by k5/k1).
         // Always written 1.0 when off (no RNG draw) so the kernels multiply
         // unconditionally and stay bit-exact (x1.0).
         g_fric[e] = 1.0f; g_mass[e] = 1.0f;
         if (g1e_dr_enable) {
-            g_fric[e] = g1e_fric_lo + (g1e_fric_hi - g1e_fric_lo) * urand_01(&rng);
-            g_mass[e] = g1e_mass_lo + (g1e_mass_hi - g1e_mass_lo) * urand_01(&rng);
+            // sample in [lo,hi], then interpolate toward 1.0 by the curriculum ramp
+            // (g1e_dr_scale=0 -> 1.0 = no DR; =1 -> full sampled range).
+            float fsamp = g1e_fric_lo + (g1e_fric_hi - g1e_fric_lo) * urand_01(&rng);
+            float msamp = g1e_mass_lo + (g1e_mass_hi - g1e_mass_lo) * urand_01(&rng);
+            g_fric[e] = 1.0f + g1e_dr_scale * (fsamp - 1.0f);
+            g_mass[e] = 1.0f + g1e_dr_scale * (msamp - 1.0f);
         }
         g_rng[e] = rng;
         g_tick[e] = 0;
@@ -258,12 +268,13 @@ __device__ void write_obs(int e, int lane, const float* g_qpos, const float* g_q
         // skipped when DR off -> obs bit-identical to baseline.
         if (g1e_dr_enable) {
             int tk = g_tick_obs[e];
-            obs[0] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 0);
-            obs[1] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 1);
-            obs[2] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 2);
-            obs[3] += g1e_noise_gravity * obs_noise_pm1(e, tk, 3);
-            obs[4] += g1e_noise_gravity * obs_noise_pm1(e, tk, 4);
-            obs[5] += g1e_noise_gravity * obs_noise_pm1(e, tk, 5);
+            float ds = g1e_dr_scale;   // DR-curriculum ramp (1.0 if no curriculum)
+            obs[0] += ds * g1e_noise_angvel  * obs_noise_pm1(e, tk, 0);
+            obs[1] += ds * g1e_noise_angvel  * obs_noise_pm1(e, tk, 1);
+            obs[2] += ds * g1e_noise_angvel  * obs_noise_pm1(e, tk, 2);
+            obs[3] += ds * g1e_noise_gravity * obs_noise_pm1(e, tk, 3);
+            obs[4] += ds * g1e_noise_gravity * obs_noise_pm1(e, tk, 4);
+            obs[5] += ds * g1e_noise_gravity * obs_noise_pm1(e, tk, 5);
         }
     }
     for (int j = lane; j < S_NU; j += 32) {
@@ -272,8 +283,9 @@ __device__ void write_obs(int e, int lane, const float* g_qpos, const float* g_q
         obs[67 + j] = g_prev[(size_t)e * S_NU + j];
         if (g1e_dr_enable) {
             int tk = g_tick_obs[e];
-            obs[9 + j]  += g1e_noise_dofpos * obs_noise_pm1(e, tk, 9 + j);
-            obs[38 + j] += g1e_noise_dofvel * obs_noise_pm1(e, tk, 38 + j);
+            float ds = g1e_dr_scale;
+            obs[9 + j]  += ds * g1e_noise_dofpos * obs_noise_pm1(e, tk, 9 + j);
+            obs[38 + j] += ds * g1e_noise_dofvel * obs_noise_pm1(e, tk, 38 + j);
         }
     }
 #ifdef G1_TASK_V3
@@ -474,10 +486,11 @@ __global__ void k_epi(int n,
     // the NEXT step; the policy feels it via the following obs). Gated -> no write and
     // no RNG draw when DR off, so the baseline is bit-identical.
     if (!done && lane == 0 && g1e_dr_enable && g1e_push_interval > 0 &&
-        g_tick[e] % g1e_push_interval == 0) {
+        g1e_dr_scale > 0.0f && g_tick[e] % g1e_push_interval == 0) {
         unsigned int rng = g_rng[e];
-        g_qvel[(size_t)e * S_NV + 0] = g1e_push_vel * urand_pm1(&rng);
-        g_qvel[(size_t)e * S_NV + 1] = g1e_push_vel * urand_pm1(&rng);
+        float pv = g1e_dr_scale * g1e_push_vel;   // curriculum-ramped push magnitude
+        g_qvel[(size_t)e * S_NV + 0] = pv * urand_pm1(&rng);
+        g_qvel[(size_t)e * S_NV + 1] = pv * urand_pm1(&rng);
         g_rng[e] = rng;
     }
     __syncwarp();
@@ -660,6 +673,21 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         double prog = (double)g_curric_steps / CS_RAMP;
         float cs = CS_START + (1.0f - CS_START) * (float)(prog < 1.0 ? prog : 1.0);
         cudaMemcpyToSymbolAsync(g1e_cmd_scale, &cs, sizeof(float), 0,
+                                cudaMemcpyHostToDevice, st);
+    }
+#endif
+#ifdef G1_DR_CURRICULUM
+    {   // DR curriculum: hold DR at 0 for DR_WARMUP samples (the forward gait forms
+        // CLEAN), then ramp dr_scale 0->1 over DR_RAMP samples. The env multiplies all
+        // DR magnitudes by dr_scale, so DR fades in instead of shocking a from-scratch
+        // (or warm-started) policy into the degenerate "survive, don't track" basin.
+        static long g_drc_steps = 0;
+        const double DR_WARMUP = 50.0e6;
+        const double DR_RAMP   = 100.0e6;   // full DR by DR_WARMUP+DR_RAMP (~150M)
+        g_drc_steps += n;
+        double prog = ((double)g_drc_steps - DR_WARMUP) / DR_RAMP;
+        float ds = (float)(prog < 0.0 ? 0.0 : (prog > 1.0 ? 1.0 : prog));
+        cudaMemcpyToSymbolAsync(g1e_dr_scale, &ds, sizeof(float), 0,
                                 cudaMemcpyHostToDevice, st);
     }
 #endif
