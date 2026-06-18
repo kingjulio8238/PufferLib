@@ -4,7 +4,7 @@
 // so contact.cu can insert the constraint solve between them.
 #pragma once
 
-#include "g1_topology.cuh"
+#include "robot_topology.cuh"
 #include "common.cuh"
 
 #define WARPS_PER_BLOCK_SMOOTH 4
@@ -293,7 +293,15 @@ __device__ void smooth_forward(EnvShared* S, int lane) {
 
     // ---- passive + bias fusion ----
     for (int i = lane; i < G1_NV; i += 32) {
-        S->qfrc_passive[i] = -g1c_dof_damping[i] * S->qvel[i];
+        // sim2real plant: leg dofs (6..17) are damped ONLY by the PD controller (kd),
+        // matching the proven unitree_rl_gym pipeline (zero mechanical joint damping on
+        // actuated legs). -DG1_LEGACY_DAMPING restores the original baked damping (the
+        // plant the <=v3 / sub-60 records trained on). See docs/sim2real.md (D1).
+        float dmp = g1c_dof_damping[i];
+#ifndef G1_LEGACY_DAMPING
+        if (i >= 6 && i < 18) dmp = 0.0f;
+#endif
+        S->qfrc_passive[i] = -dmp * S->qvel[i];
         S->qfrc_smooth[i] = S->qfrc_passive[i] - S->qfrc_bias[i];
     }
     __syncwarp();
@@ -308,6 +316,10 @@ __device__ void smooth_forward(EnvShared* S, int lane) {
         c = c < lo ? lo : (c > hi ? hi : c);
         float force = g1c_act_gain0[a] * c + g1c_act_bias1[a] * S->qpos[padr]
                       + g1c_act_bias2[a] * S->qvel[dadr];
+        if (g1c_act_forcelimited[a]) {   // per-actuator clamp (Go2 motors ~±24)
+            float flo = g1c_act_forcerange[2 * a], fhi = g1c_act_forcerange[2 * a + 1];
+            force = force < flo ? flo : (force > fhi ? fhi : force);
+        }
         if (g1c_jnt_actfrclimited[j]) {
             float flo = g1c_jnt_actfrcrange[2 * j], fhi = g1c_jnt_actfrcrange[2 * j + 1];
             force = force < flo ? flo : (force > fhi ? fhi : force);

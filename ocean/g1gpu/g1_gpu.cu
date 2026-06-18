@@ -85,6 +85,49 @@ __device__ int g1e_max_ep_len;
 __device__ float g1e_cmd_scale = 1.0f;
 
 // ---------------------------------------------------------------------------
+// Domain randomization / sim2real (Phase 1). MASTER SWITCH g1e_dr_enable: when
+// 0 (default), EVERY DR path below is skipped entirely — no extra RNG draws, no
+// added noise — so the env is BIT-IDENTICAL to the pre-DR baseline (gate G1a).
+// Ranges are set from env kwargs via my_gpu_config_dr (see binding.c). See
+// docs/sim2real.md (D4) for the reference ranges.
+// ---------------------------------------------------------------------------
+__device__ int   g1e_dr_enable = 0;        // 0 = OFF (bit-exact baseline)
+// observation noise (actor-only; uniform U[-1,1]*scale added per channel group).
+// These are OBS-SPACE scales — added AFTER the obs scaling, i.e. the EFFECTIVE
+// per-element noise, NOT physical units. They equal (unitree physical noise x the
+// obs scale). D4 reference (docs/sim2real.md): angvel 0.05, gravity 0.05, dofpos
+// 0.01, dofvel 0.075. Do NOT pass physical values here (e.g. dofvel 1.5) — that
+// would be 20x too large; pass 0.075 (= 1.5 rad/s x the 0.05 obs scale).
+__device__ float g1e_noise_angvel  = 0.0f; // obs[0:3]  (0.05 = 0.2 rad/s x 0.25)
+__device__ float g1e_noise_gravity = 0.0f; // obs[3:6]  (0.05, obs scale 1.0)
+__device__ float g1e_noise_dofpos  = 0.0f; // obs[9:38] (0.01 = 0.01 rad x 1.0)
+__device__ float g1e_noise_dofvel  = 0.0f; // obs[38:67] (0.075 = 1.5 rad/s x 0.05)
+// external push: every g1e_push_interval control steps, base xy lin-vel is set
+// to U[-push_vel, push_vel] (matches unitree_rl_gym root-state push).
+__device__ int   g1e_push_interval = 0;    // 0 = no push
+__device__ float g1e_push_vel      = 0.0f; // m/s
+// init-state randomization: base lin+ang vel set to U[-init_basevel, +] at reset
+__device__ float g1e_init_basevel  = 0.0f; // m/s & rad/s; 0 = keep qvel=0
+// per-env friction & mass scale ranges. STAGED: the kwarg interface is wired, but
+// these are NOT yet read by the physics kernels — per-env de-baking of
+// g1c_pair_friction (k5_assemble, 4 sites) and body inertia (k1, COM+subtree+inertia)
+// is the Phase-1 GPU-co-dev remainder (needs a compile+validate-vs-MuJoCo-C loop on
+// real hardware). my_gpu_config_dr warns if these are set so it's never a silent no-op.
+__device__ float g1e_fric_lo = 1.0f, g1e_fric_hi = 1.0f;
+__device__ float g1e_mass_lo = 1.0f, g1e_mass_hi = 1.0f;
+
+// Stateless per-(env,tick,channel) noise in [-1,1] — a hash, NOT the dynamics
+// RNG, so observation noise never perturbs the reset/cmd/push RNG stream (keeps
+// dynamics reproducible) and needs no extra per-env state.
+__device__ __forceinline__ float obs_noise_pm1(int e, int tick, int ch) {
+    unsigned int h = (unsigned int)e * 0x9e3779b9u
+                   ^ (unsigned int)(tick + 1) * 0x85ebca6bu
+                   ^ (unsigned int)(ch + 1) * 0xc2b2ae35u;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return 2.0f * ((h >> 8) * (1.0f / 16777216.0f)) - 1.0f;
+}
+
+// ---------------------------------------------------------------------------
 // device helpers (validated semantics from stagedenv.cu)
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ unsigned int xorshift32(unsigned int* s) {
@@ -158,6 +201,12 @@ __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
             g_cmd[3 * e + 1] = g1e_cmd_scale * 0.6f * urand_pm1(&rng);
             g_cmd[3 * e + 2] = g1e_cmd_scale * 1.0f * urand_pm1(&rng);
         }
+        // DR init-state: randomize base lin+ang velocity at reset (gated; skipped
+        // when DR off -> no extra RNG draws -> bit-exact baseline).
+        if (g1e_dr_enable && g1e_init_basevel > 0.0f) {
+            for (int k = 0; k < 6; k++)
+                g_qvel[(size_t)e * S_NV + k] = g1e_init_basevel * urand_pm1(&rng);
+        }
         g_rng[e] = rng;
         g_tick[e] = 0;
         g_eplog[(size_t)e * EPLOG_N + 0] = 0.0f;
@@ -195,11 +244,28 @@ __device__ void write_obs(int e, int lane, const float* g_qpos, const float* g_q
         obs[2] = 0.25f * g_qvel[(size_t)e * S_NV + 5];
         obs[3] = gb[0]; obs[4] = gb[1]; obs[5] = gb[2];
         obs[6] = g_cmd[3*e]; obs[7] = g_cmd[3*e+1]; obs[8] = g_cmd[3*e+2];
+        // DR observation noise (actor-only; cmd/phase un-noised). Stateless hash
+        // keyed on (env,tick,channel) -> independent of the dynamics RNG. Gated:
+        // skipped when DR off -> obs bit-identical to baseline.
+        if (g1e_dr_enable) {
+            int tk = g_tick_obs[e];
+            obs[0] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 0);
+            obs[1] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 1);
+            obs[2] += g1e_noise_angvel  * obs_noise_pm1(e, tk, 2);
+            obs[3] += g1e_noise_gravity * obs_noise_pm1(e, tk, 3);
+            obs[4] += g1e_noise_gravity * obs_noise_pm1(e, tk, 4);
+            obs[5] += g1e_noise_gravity * obs_noise_pm1(e, tk, 5);
+        }
     }
     for (int j = lane; j < S_NU; j += 32) {
         obs[9 + j]  = g_qpos[(size_t)e * S_NQ + 7 + j] - g1c_key_qpos[7 + j];
         obs[38 + j] = 0.05f * g_qvel[(size_t)e * S_NV + 6 + j];
         obs[67 + j] = g_prev[(size_t)e * S_NU + j];
+        if (g1e_dr_enable) {
+            int tk = g_tick_obs[e];
+            obs[9 + j]  += g1e_noise_dofpos * obs_noise_pm1(e, tk, 9 + j);
+            obs[38 + j] += g1e_noise_dofvel * obs_noise_pm1(e, tk, 38 + j);
+        }
     }
 #ifdef G1_TASK_V3
     if (lane == 0) {
@@ -394,6 +460,17 @@ __global__ void k_epi(int n,
         g_rng[e] = rng;
     }
     __syncwarp();
+    // DR external push: periodically set base xy lin-vel to U[+-push_vel] (perturbs
+    // the NEXT step; the policy feels it via the following obs). Gated -> no write and
+    // no RNG draw when DR off, so the baseline is bit-identical.
+    if (!done && lane == 0 && g1e_dr_enable && g1e_push_interval > 0 &&
+        g_tick[e] % g1e_push_interval == 0) {
+        unsigned int rng = g_rng[e];
+        g_qvel[(size_t)e * S_NV + 0] = g1e_push_vel * urand_pm1(&rng);
+        g_qvel[(size_t)e * S_NV + 1] = g1e_push_vel * urand_pm1(&rng);
+        g_rng[e] = rng;
+    }
+    __syncwarp();
     write_obs(e, lane, g_qpos, g_qvel, g_prev, g_cmd, g_tick, vec_obs + (size_t)e * ENV_OBS);
 }
 
@@ -436,6 +513,36 @@ extern "C" void my_gpu_config(float action_scale, float w_track_lin,
     CUDA_CHECK(cudaMemcpyToSymbol(g1e_w_alive, &w_alive, 4));
     CUDA_CHECK(cudaMemcpyToSymbol(g1e_w_termination, &w_termination, 4));
     CUDA_CHECK(cudaMemcpyToSymbol(g1e_max_ep_len, &max_episode_len, 4));
+}
+
+// Domain-randomization config (Phase 1). dr_enable=0 -> full bit-exact baseline.
+// obs-noise/push/init-basevel are ACTIVE; friction/mass ranges are accepted but
+// STAGED (not yet read by kernels) and warned about so they're never a silent no-op.
+extern "C" void my_gpu_config_dr(int dr_enable,
+        float noise_angvel, float noise_gravity, float noise_dofpos, float noise_dofvel,
+        int push_interval, float push_vel, float init_basevel,
+        float fric_lo, float fric_hi, float mass_lo, float mass_hi) {
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_dr_enable, &dr_enable, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_noise_angvel, &noise_angvel, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_noise_gravity, &noise_gravity, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_noise_dofpos, &noise_dofpos, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_noise_dofvel, &noise_dofvel, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_push_interval, &push_interval, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_push_vel, &push_vel, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_init_basevel, &init_basevel, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_fric_lo, &fric_lo, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_fric_hi, &fric_hi, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_mass_lo, &mass_lo, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(g1e_mass_hi, &mass_hi, 4));
+    if (!dr_enable) return;
+    printf("g1gpu DR: ON  obs-noise[ang %.3f grav %.3f dofpos %.3f dofvel %.3f]  "
+           "push[every %d @ %.2f m/s]  init_basevel %.2f\n",
+           noise_angvel, noise_gravity, noise_dofpos, noise_dofvel,
+           push_interval, push_vel, init_basevel);
+    if (fric_lo != 1.0f || fric_hi != 1.0f || mass_lo != 1.0f || mass_hi != 1.0f)
+        printf("g1gpu DR: WARNING friction[%.2f,%.2f]/mass[%.2f,%.2f] randomization is "
+               "STAGED but NOT wired to the physics kernels yet (Phase-1 GPU-co-dev "
+               "remainder) -> IGNORED this run.\n", fric_lo, fric_hi, mass_lo, mass_hi);
 }
 
 extern "C" void my_gpu_init(int total_agents, unsigned int seed) {

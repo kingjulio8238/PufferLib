@@ -6,10 +6,11 @@
 
 #include "g1_step.cuh"
 
-// fixed-shape efc bounds (docs/phase2.md C1 audit)
-#define NCON_MAX 16       // 4+4 feet + 2+2 capsules (parallel-axes worst) + slack
-#define NCROW_MAX 38      // 8*4 pyramidal + 4 frictionless rows + 3-row jacdif scratch
-#define NEFC_MAX 96       // 29 friction + 29 limits + contact rows
+// fixed-shape efc bounds — emitted per-robot by gen_robot.py (G1: 20/44/106;
+// Go2: 23/92/108). Computed from the contact candidate set + condim.
+#define NCON_MAX G1_NCON_MAX
+#define NCROW_MAX G1_NCROW_MAX
+#define NEFC_MAX G1_NEFC_MAX
 
 // solver options (the wall; mirrored from the mjb in gen, hardcoded here)
 #ifndef SOL_ITER
@@ -20,7 +21,16 @@
 #endif
 #define SOL_TOL 1e-8f
 #define SOL_LS_TOL 0.01f
+// pyramidal-cone R scale = model opt.impratio; emitted per-robot by gen_robot
+// (G1: 1.0, Go2: 100.0). Hardcoding 1.0 silently broke any robot with
+// impratio != 1 (the Go2 quadruped: D came out 100x too small -> wrong solve).
+#ifndef SOL_IMPRATIO
+#ifdef G1_IMPRATIO
+#define SOL_IMPRATIO G1_IMPRATIO
+#else
 #define SOL_IMPRATIO 1.0f
+#endif
+#endif
 
 __device__ float g1c_meaninertia;   // m->stat.meaninertia (set by host)
 __device__ float g1c_dof_invweight0[G1_NV];
@@ -132,6 +142,25 @@ __device__ int plane_box_np(const float* xpos, const float* xquat, int g1, int g
         cnt++;
     }
     return cnt;
+}
+
+// plane(g1) x sphere(g2): one contact (mirrors oracle_contact.plane_sphere).
+__device__ int plane_sphere_np(const float* xpos, const float* xquat, int g1, int g2,
+                               float* dist, float* pos, float* norm_out) {
+    float p1[3], m1[9], p2[3], m2[9];
+    geom_pose(xpos, xquat, g1, p1, m1);
+    geom_pose(xpos, xquat, g2, p2, m2);
+    float r = g1c_geom_size[3 * g2];                  // sphere radius
+    float norm[3] = {m1[2], m1[5], m1[8]};            // plane z-axis
+    float dif[3] = {p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2]};
+    float cd = dif[0]*norm[0] + dif[1]*norm[1] + dif[2]*norm[2] - r;
+    if (cd >= 0.0f) return 0;                          // includemargin = 0
+    dist[0] = cd;
+    pos[0] = p2[0] - norm[0]*(r + 0.5f*cd);
+    pos[1] = p2[1] - norm[1]*(r + 0.5f*cd);
+    pos[2] = p2[2] - norm[2]*(r + 0.5f*cd);
+    norm_out[0] = norm[0]; norm_out[1] = norm[1]; norm_out[2] = norm[2];
+    return 1;
 }
 
 // sphere-sphere core used by capsule-capsule (radii r1, r2 at points c1, c2)
@@ -461,7 +490,7 @@ __device__ void chol_solve_par(ConShared* C, const float* L, const float* b, int
 // and warm-start in ws[nv]. Leaves final qacc in S->qacc, forces in C.
 // ---------------------------------------------------------------------------
 __device__ void newton_solve(EnvShared* S, ConShared* C, const float* ws, int lane,
-                             int prof_en = 0) {
+                             int prof_en = 0, int trace = -1) {
     int nv = G1_NV;
     float* H = hessian_ptr(S);
     PROF_START(prof_en);
@@ -703,6 +732,12 @@ __device__ void newton_solve(EnvShared* S, ConShared* C, const float* ws, int la
         for (int o = 16; o > 0; o >>= 1) gn += __shfl_xor_sync(0xffffffff, gn, o);
         float improvement = scale * (oldcost - cost);
         float gradient = scale * sqrtf(gn);
+        if (trace >= 0 && lane == 0) {
+            int nact = 0;
+            for (int r = 0; r < C->nefc; r++) nact += (C->state[r] == ST_QUAD);
+            printf("TRACE iter=%d alpha=%.5g snorm=%.4g cost=%.6g oldcost=%.6g impr=%.3e grad=%.3e nact=%d/%d qacc3=%.3f qacc6=%.3f\n",
+                   iter, alpha, snorm, cost, oldcost, improvement, gradient, nact, C->nefc, S->qacc[3], S->qacc[6]);
+        }
         PROF_MARK(prof_en, 6);
         if (improvement < SOL_TOL || gradient < SOL_TOL) break;
     }
@@ -722,12 +757,15 @@ __device__ void assemble_constraints(EnvShared* S, ConShared* C, int lane) {
             int t1 = g1c_geom_type[g1], t2 = g1c_geom_type[g2];
             // per-pair capacity (plane-box 4, capsule-capsule 2): skip ONLY
             // this pair if it cannot fit — never abort the whole loop
-            int need = (t1 == 0 && t2 == 6) ? 4 : 2;
+            int need = (t1 == 0 && t2 == 6) ? 4 : (t1 == 0 && t2 == 2) ? 1 : 2;
             if (n + need > NCON_MAX) continue;
             int cnt = 0;
             if (t1 == 0 /*PLANE*/ && t2 == 6 /*BOX*/) {
                 cnt = plane_box_np(S->xpos, S->xquat, g1, g2, C->con_dist + n, C->con_pos + 3*n,
                                    C->con_norm + 3*n);
+            } else if (t1 == 0 /*PLANE*/ && t2 == 2 /*SPHERE*/) {
+                cnt = plane_sphere_np(S->xpos, S->xquat, g1, g2, C->con_dist + n, C->con_pos + 3*n,
+                                      C->con_norm + 3*n);
             } else if (t1 == 3 /*CAPSULE*/ && t2 == 3) {
                 cnt = capsule_capsule_np(S->xpos, S->xquat, g1, g2, C->con_dist + n, C->con_pos + 3*n,
                                          C->con_norm + 3*n);

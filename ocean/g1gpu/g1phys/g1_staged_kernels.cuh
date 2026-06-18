@@ -6,6 +6,7 @@
 
 #ifdef SPARSE_SOLVER
 #include "g1_aug_topology.cuh"   // augmented 417 Newton-Hessian sparsity (incl cross-branch contacts)
+#include "g1_aug_factor.cuh"     // unrolled straight-line LDL factor (thread-per-env, no indirection)
 #endif
 
 #define G1_TRI (G1_NV * (G1_NV + 1) / 2)
@@ -157,12 +158,14 @@ __global__ void k2_crb_factor(int n, const float* __restrict__ g_cinert,
 
     for (int k = lane; k < S_CI; k += 32) crb[k] = g_cinert[(size_t)e * S_CI + k];
     __syncwarp();
+#ifndef K2_SKIP_BWD     // headroom probe: skip the CRB backward (serial tree reduction)
     if (lane < 10) {
         for (int i = G1_NBODY - 1; i >= 1; i--) {
             int p = g1c_body_parentid[i];
             if (p > 0) crb[10 * p + lane] += crb[10 * i + lane];
         }
     }
+#endif
     __syncwarp();
     float* gqM = g_qM + (size_t)e * G1_NM;
     for (int i = lane; i < G1_NV; i += 32) {
@@ -218,7 +221,7 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
                                  float* __restrict__ g_act_force) {
     // smem diet: qLD/diag (lane-0 serial solve) and qpos (one actuation read)
     // served from L2; bias folded into smooth. 5.4KB -> 3.5KB per env.
-#ifndef K3_SMEM_DIET   // serve read-only cdof from L2 (-6.7KB -> occupancy; -6.4% measured)
+#ifndef K3_SMEM_DIET   // serve read-only cdof from L2 instead of smem (-6.7KB -> occupancy)
     __shared__ float s_cdof[SWARPS][S_CD];
 #endif
     __shared__ float s_cvel[SWARPS][G1_NBODY * 6];
@@ -227,6 +230,11 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     __shared__ float s_qvel[SWARPS][G1_NV];
     __shared__ float s_smooth[SWARPS][G1_NV];
     __shared__ float s_qacc[SWARPS][G1_NV];
+#ifdef K3_FATSMEM    // occupancy probe: push smem 28.7KB -> ~47KB (near the 48KB static
+                     // cap). If k3 slows a lot -> occupancy-bound (smem diet helps); flat ->
+                     // compute/latency-bound like k7 (skip the diet).
+    __shared__ float s_pad[SWARPS][600];
+#endif
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
@@ -244,7 +252,13 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
     const float* qpos = g_qpos + (size_t)e * S_NQ;
     float* smoo = s_smooth[warp];
     float* qacc = s_qacc[warp];
+#ifdef K3_FATSMEM    // force s_pad live so ptxas can't elide it
+    for (int k = lane; k < 600; k += 32) s_pad[warp][k] = (float)(e + k);
+    if (s_pad[warp][lane] == -123456.0f) qacc[0] = s_pad[warp][0];
+    __syncwarp();
+#endif
 
+#ifndef K3_SOLVE_ONLY   // E: K3_SOLVE_ONLY isolates the lane-0 LDL solve (skips comVel+RNE+actuation)
 #ifndef K3_SMEM_DIET
     for (int k = lane; k < S_CD; k += 32) cdof[k] = g_cdof[(size_t)e * S_CD + k];
 #endif
@@ -313,17 +327,26 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
         }
         __syncwarp();
     }
+#ifndef K3_SKIP_BWD     // headroom probe: skip the RNE cvel backward (serial tree reduction)
     if (lane < 6) {
         for (int i = G1_NBODY - 1; i >= 1; i--) {
             int p = g1c_body_parentid[i];
             if (p) cvel[6 * p + lane] += cvel[6 * i + lane];
         }
     }
+#endif
     __syncwarp();
     // passive + bias fusion + PD actuation (bias folded; identical op order)
     for (int i = lane; i < G1_NV; i += 32) {
         float b = dot6(cdof + 6 * i, cvel + 6 * g1c_dof_bodyid[i]);
-        smoo[i] = -g1c_dof_damping[i] * qvel[i] - b;
+        // sim2real plant: leg dofs (6..17) damped ONLY by PD kd (zero mechanical joint
+        // damping), per the proven unitree_rl_gym pipeline. -DG1_LEGACY_DAMPING restores
+        // the original baked damping (<=v3 / sub-60 plant). See docs/sim2real.md (D1).
+        float dmp = g1c_dof_damping[i];
+#ifndef G1_LEGACY_DAMPING
+        if (i >= 6 && i < 18) dmp = 0.0f;
+#endif
+        smoo[i] = -dmp * qvel[i] - b;
     }
     __syncwarp();
     if (lane < G1_NU) {
@@ -348,6 +371,10 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
 #endif
         force = g1c_act_gain0[a] * c + g1c_act_bias1[a] * qpos[padr]
                       + g1c_act_bias2[a] * qvel[dadr];
+        if (g1c_act_forcelimited[a]) {   // per-actuator clamp (Go2 motors ~±24)
+            float flo = g1c_act_forcerange[2 * a], fhi = g1c_act_forcerange[2 * a + 1];
+            force = force < flo ? flo : (force > fhi ? fhi : force);
+        }
         if (g1c_jnt_actfrclimited[j]) {
             float flo = g1c_jnt_actfrcrange[2 * j], fhi = g1c_jnt_actfrcrange[2 * j + 1];
             force = force < flo ? flo : (force > fhi ? fhi : force);
@@ -356,9 +383,32 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
         g_act_force[(size_t)e * S_NU + a] = force;
     }
     __syncwarp();
+#endif  // K3_SOLVE_ONLY
 
-#ifndef K3_SPLIT
     // qacc_smooth = LDL solve (lane-0 serial v1; its own kernel later if hot)
+#if !defined(K3_NO_SOLVE) && !defined(K3_SPLIT)  // K3_SPLIT: solve moved to k3b_ldlsolve (thread-per-env)
+#ifdef K3_SOLVE_PAR     // GO/NO-GO TIMING TEST (RACY, not bit-exact): distribute the
+                        // 35-dof solve across all 32 lanes. If k3 drops a lot ->
+                        // parallelizing is the lever (then build a correct level-
+                        // scheduled solve). If ~flat -> dependency-latency-bound (k7).
+    for (int i = lane; i < G1_NV; i += 32) qacc[i] = smoo[i];
+    __syncwarp();
+    for (int i = G1_NV - 1 - lane; i >= 0; i -= 32) {
+        if (qacc[i] != 0.0f) {
+            int adr = g1c_dof_Madr[i] + 1;
+            for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+                qacc[j] -= qLD[adr++] * qacc[i];   // RACE on qacc[j] — timing only
+        }
+    }
+    __syncwarp();
+    for (int i = lane; i < G1_NV; i += 32) qacc[i] *= diag[i];
+    __syncwarp();
+    for (int i = lane; i < G1_NV; i += 32) {
+        int adr = g1c_dof_Madr[i] + 1;
+        for (int j = g1c_dof_parentid[i]; j >= 0; j = g1c_dof_parentid[j])
+            qacc[i] -= qLD[adr++] * qacc[j];
+    }
+#else
     if (lane == 0) {
         for (int i = 0; i < G1_NV; i++) qacc[i] = smoo[i];
         for (int i = G1_NV - 1; i >= 0; i--) {
@@ -375,26 +425,23 @@ __global__ void k3_rne_act_solve(int n, const float* __restrict__ g_qpos,
                 qacc[i] -= qLD[adr++] * qacc[j];
         }
     }
+#endif  // K3_SOLVE_PAR
+#endif  // K3_NO_SOLVE
     __syncwarp();
     for (int k = lane; k < G1_NV; k += 32) {
         g_qfrc_smooth[(size_t)e * G1_NV + k] = smoo[k];
-        g_qacc_smooth[(size_t)e * G1_NV + k] = qacc[k];
-    }
+#if defined(K3_NO_SOLVE) || defined(K3_SPLIT)
+        (void)qacc;   // qacc not computed here (K3_SPLIT: k3b does it)
 #else
-    // K3_SPLIT: qacc_smooth solve moved to k3b_ldlsolve (thread-per-env). k3 only
-    // writes qfrc_smooth; k3b reads it back and writes qacc_smooth (bit-identical).
-    (void)qacc; (void)qLD; (void)diag;
-    __syncwarp();
-    for (int k = lane; k < G1_NV; k += 32) {
-        g_qfrc_smooth[(size_t)e * G1_NV + k] = smoo[k];
-    }
+        g_qacc_smooth[(size_t)e * G1_NV + k] = qacc[k];
 #endif
+    }
 }
 
-// k3b: thread-per-env LDL solve. The EXACT serial algorithm of k3's old lane-0
-// solve, but one thread per env -> all 32 lanes of a warp run different envs
-// (no idle lanes). Bit-identical to the serial solve. qacc[35] dynamic-indexed
-// (pointer-chase) -> local memory, L1-cached. ~12x faster than lane-0 serial.
+// k3b: thread-per-env LDL solve (K3_SPLIT). The exact serial algorithm of k3's
+// lane-0 solve, but ONE THREAD PER ENV -> all 32 lanes of a warp do different
+// envs (no idle lanes). Bit-identical to the serial solve. qacc[35] is dynamic-
+// indexed (pointer-chase) -> local memory, L1-cached.
 __global__ void k3b_ldlsolve(int n, const float* __restrict__ g_qfrc_smooth,
                              const float* __restrict__ g_qLD,
                              const float* __restrict__ g_qLDiagInv,
@@ -555,8 +602,10 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                             float* __restrict__ g_cJ,
                             const float* __restrict__ g_cdof,
                             float* __restrict__ g_footc) {  // per-env {L,R} foot contact flags
+#ifndef K5_SMEM_DIET   // serve read-only xpos/xquat from L2 (free ~6.9KB -> occupancy)
     __shared__ float s_xpos[SWARPS][S_X3];
     __shared__ float s_xquat[SWARPS][S_X4];
+#endif
     __shared__ float s_qpos[SWARPS][S_NQ];
     __shared__ float s_qvel[SWARPS][S_NV];
     __shared__ float s_com[SWARPS][3];
@@ -569,8 +618,13 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
+#ifdef K5_SMEM_DIET
+    const float* xpos = g_xpos + (size_t)e * S_X3;     // L2-served (read-only)
+    const float* xquat = g_xquat + (size_t)e * S_X4;
+#else
     float* xpos = s_xpos[warp];
     float* xquat = s_xquat[warp];
+#endif
     float* qpos = s_qpos[warp];
     float* qvel = s_qvel[warp];
     float* com = s_com[warp];
@@ -581,8 +635,10 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
     int* cpair = s_cpair[warp];
     int* cnt = s_cnt[warp];
 
+#ifndef K5_SMEM_DIET
     for (int k = lane; k < S_X3; k += 32) xpos[k] = g_xpos[(size_t)e * S_X3 + k];
     for (int k = lane; k < S_X4; k += 32) xquat[k] = g_xquat[(size_t)e * S_X4 + k];
+#endif
     for (int k = lane; k < S_NQ; k += 32) qpos[k] = g_qpos[(size_t)e * S_NQ + k];
     for (int k = lane; k < S_NV; k += 32) qvel[k] = g_qvel[(size_t)e * S_NV + k];
     if (lane < 3) com[lane] = g_gcom[(size_t)e * 3 + lane];
@@ -594,11 +650,13 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
         for (int p = 0; p < G1_NPAIR; p++) {
             int g1 = g1c_pair_geom1[p], g2 = g1c_pair_geom2[p];
             int t1 = g1c_geom_type[g1], t2 = g1c_geom_type[g2];
-            int need = (t1 == 0 && t2 == 6) ? 4 : 2;
+            int need = (t1 == 0 && t2 == 6) ? 4 : (t1 == 0 && t2 == 2) ? 1 : 2;
             if (nc + need > NCON_MAX) continue;
             int c2 = 0;
             if (t1 == 0 && t2 == 6)
                 c2 = plane_box_np(xpos, xquat, g1, g2, cdist + nc, cpos + 3*nc, cnorm + 3*nc);
+            else if (t1 == 0 && t2 == 2)   // plane × sphere (Go2 feet)
+                c2 = plane_sphere_np(xpos, xquat, g1, g2, cdist + nc, cpos + 3*nc, cnorm + 3*nc);
             else if (t1 == 3 && t2 == 3)
                 c2 = capsule_capsule_np(xpos, xquat, g1, g2, cdist + nc, cpos + 3*nc, cnorm + 3*nc);
             for (int c = 0; c < c2; c++) cpair[nc + c] = p;
@@ -667,7 +725,8 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
             const float* gcd = g_cdof + (size_t)e * S_CD;
 #ifdef K5_PARALLEL
             // lane-parallel over the body's kinematic chain (last dof + ancestors),
-            // bit-exact; __syncwarp between sides for shared base dofs.
+            // bit-exact (each jd[dof] independent; __syncwarp between sides for shared
+            // base dofs). Recovers the 31 idle lanes of the lane-0 serial chain-walk.
             for (int side = 0; side < 2; side++) {
                 int body = side == 0 ? b1 : b2;
                 if (body == 0) continue;
@@ -686,20 +745,21 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                 __syncwarp();
             }
 #else
-            if (lane == 0)
-            for (int side = 0; side < 2; side++) {
-                int body = side == 0 ? b1 : b2;
-                float sgn = side == 0 ? -1.0f : 1.0f;
-                if (body == 0) continue;
-                int i = g1c_body_dofadr[body] + g1c_body_dofnum[body] - 1;
-                while (i >= 0) {
-                    const float* cd = gcd + 6 * i;
-                    float t[3];
-                    cross3(t, cd, off);
-                    jd[0 * G1_NV + i] += sgn * (cd[3] + t[0]);
-                    jd[1 * G1_NV + i] += sgn * (cd[4] + t[1]);
-                    jd[2 * G1_NV + i] += sgn * (cd[5] + t[2]);
-                    i = g1c_dof_parentid[i];
+            if (lane == 0) {
+                for (int side = 0; side < 2; side++) {
+                    int body = side == 0 ? b1 : b2;
+                    float sgn = side == 0 ? -1.0f : 1.0f;
+                    if (body == 0) continue;
+                    int i = g1c_body_dofadr[body] + g1c_body_dofnum[body] - 1;
+                    while (i >= 0) {
+                        const float* cd = gcd + 6 * i;
+                        float t[3];
+                        cross3(t, cd, off);
+                        jd[0 * G1_NV + i] += sgn * (cd[3] + t[0]);
+                        jd[1 * G1_NV + i] += sgn * (cd[4] + t[1]);
+                        jd[2 * G1_NV + i] += sgn * (cd[5] + t[2]);
+                        i = g1c_dof_parentid[i];
+                    }
                 }
             }
 #endif
@@ -954,8 +1014,15 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
                            const float* __restrict__ g_scal,
                            float* __restrict__ g_H,
                            int* __restrict__ g_hvalid) {
-#ifdef SPARSE_SOLVER
-    __shared__ float s_HLD[SWARPS][G1_NM_AUG];   // augmented sparse factor (417) vs dense 630
+#if defined(SPARSE_SOLVER)
+    // Sparse tree-structured H factor: H = M + jointdiag + J'DJ has EXACTLY M's
+    // pattern (contacts are tree-chains -> 0 fill; verified). Build in the 341-entry
+    // dof_Madr layout, factor tree-order (k2's mj_factorI_legacy), store HLD+HLDiagInv
+    // in g_H (reused: [0,G1_NM) = HLD, [G1_NM,G1_NM+G1_NV) = HLDiagInv). k8 solves
+    // k3b-style. Tolerance-validated (tree order != MuJoCo dense-forward Cholesky).
+    __shared__ float s_HLD[SWARPS][G1_NM_AUG];
+#elif defined(K7_FATSMEM)   // confirmation test: 2x smem -> halve blocks/SM.
+    __shared__ float s_H[SWARPS][G1_TRI * 2];
 #else
     __shared__ float s_H[SWARPS][G1_TRI];
 #endif
@@ -963,6 +1030,9 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
     if (g_scal[(size_t)e * NSCAL + SC_DONE] != 0.0f) return;
+#ifdef K7_FATSMEM   // force the upper half to be live so ptxas can't elide it
+    if (g_scal[(size_t)e * NSCAL + SC_DONE] == 1234.5f) s_H[warp][G1_TRI + lane] = 1.0f;
+#endif
     // H depends ONLY on the constraint active-set pattern (M, J, D fixed
     // within a substep). If no row changed state since the last build, the
     // factored H in global memory is bit-identical -> skip rebuild+factor.
@@ -979,10 +1049,10 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
     const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
 
 #ifdef SPARSE_SOLVER
-    // AUGMENTED sparse build + general LDL factor (417-pattern: M + cross-branch contact
-    // cliques; chordal -> no fill; loc-table generalizes k2's update). See g1_aug_topology.cuh.
+    // --- AUGMENTED sparse build + general LDL factor (417-pattern: M + cross-branch
+    //     contact cliques; chordal -> no fill; loc-table generalizes k2's update). ---
     float* HLD = s_HLD[warp];
-    for (int k = lane; k < G1_NM_AUG; k += 32) {             // H = M (map 341 tree -> 417; cross=0)
+    for (int k = lane; k < G1_NM_AUG; k += 32) {             // H = M (map 341 tree -> 417 aug; cross=0)
         int src = g1c_aug_mcopy[k];
         HLD[k] = (src >= 0) ? qM[src] : 0.0f;
     }
@@ -996,12 +1066,12 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
         if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
         float Dr = D[r];
         const float* J = cJ + rd[r] * G1_NV;
-        for (int i = lane; i < nv; i += 32) {
+        for (int i = lane; i < nv; i += 32) {                // lane owns dof i -> disjoint rows
             float Ji = J[i];
             if (Ji == 0.0f) continue;
             float DJi = Dr * Ji;
             int Mi = g1c_aug_Madr[i], ni = g1c_aug_Madr[i + 1] - Mi - 1;
-            HLD[Mi] += DJi * Ji;
+            HLD[Mi] += DJi * Ji;                             // (i,i)
             for (int c = 0; c < ni; c++) {
                 float Jj = J[g1c_aug_chain[i * G1_MAXAUG + c]];
                 if (Jj != 0.0f) HLD[Mi + 1 + c] += DJi * Jj;
@@ -1009,35 +1079,26 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
         }
         __syncwarp();
     }
-    for (int k = G1_NV - 1; k >= 0; k--) {                   // general tree-order LDL factor
-        int Mk = g1c_aug_Madr[k];
-        int nanc = g1c_aug_Madr[k + 1] - Mk - 1;
-        float Dk = HLD[Mk];
-        int i = (lane < nanc) ? g1c_aug_chain[k * G1_MAXAUG + lane] : -1;
-        float tmp = (i >= 0) ? HLD[Mk + 1 + lane] / Dk : 0.0f;
-        __syncwarp();
-        if (i >= 0) {
-            int Mi = g1c_aug_Madr[i], ni = g1c_aug_Madr[i + 1] - Mi - 1;
-            HLD[Mi] -= tmp * HLD[Mk + 1 + lane];
-            for (int c = 0; c < ni; c++) {
-                int lkj = g1c_aug_loc[k * G1_NV + g1c_aug_chain[i * G1_MAXAUG + c]];
-                if (lkj >= 0) HLD[Mi + 1 + c] -= tmp * HLD[Mk + lkj];
-            }
-        }
-        __syncwarp();
-        if (i >= 0) HLD[Mk + 1 + lane] = tmp;
-        __syncwarp();
-    }
-    for (int k = lane; k < G1_NM_AUG; k += 32)               // store HLD (417) + HLDiagInv (35)
+    // build only: write UNFACTORED H to g_H; k7b_factor (thread-per-env, unrolled) factors it
+    // and sets hvalid (so the memoized skip path stays consistent across the split).
+    for (int k = lane; k < G1_NM_AUG; k += 32)
         g_H[(size_t)e * (size_t)G1_TRI + k] = HLD[k];
-    for (int i = lane; i < nv; i += 32)
-        g_H[(size_t)e * (size_t)G1_TRI + G1_NM_AUG + i] = 1.0f / HLD[g1c_aug_Madr[i]];
-    if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
     return;
 #else
     float* H = s_H[warp];
+
+    // --- idiot-index micro-experiment variants (TIMING-ONLY; break correctness
+    //     by design — read k7 ms/step from the PROFILE table, ignore validate). ---
+#ifdef K7_FACTOR_ONLY
+    // E1: skip the build; factor a synthetic dense diagonally-dominant SPD H so
+    // the Cholesky does full trailing updates (representative factor timing).
+    for (int k = lane; k < G1_TRI; k += 32) H[k] = 1.0f;
+    for (int i = lane; i < nv; i += 32) H[tridx(i, i)] = (float)nv;
+    __syncwarp();
+#else
     for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
     __syncwarp();
+#ifndef K7_NO_MCOPY     // E6: K7_NO_MCOPY skips the sparse-M tree-walk copy
     for (int i = lane; i < nv; i += 32) {
         int adr = g1c_dof_Madr[i];
         H[tridx(i, i)] = qM[adr++];
@@ -1045,42 +1106,119 @@ __global__ void k7_hessian(int n, const float* __restrict__ g_qM,
             H[tridx(i, j)] = qM[adr++];
     }
     __syncwarp();
+#endif
     for (int r = lane; r < nefc; r += 32) {
         if (state[r] != ST_QUAD || rt[r] == ROW_CONTACT) continue;
         atomicAdd(&H[tridx(rd[r], rd[r])], D[r]);
     }
     __syncwarp();
+#ifndef K7_NO_JDJ       // E6: K7_NO_JDJ skips the J'DJ contact rank-updates
+#ifdef K7_JDJ_REG
+    // REG: register-accumulation. Row loop OUTER, contact loop INNER. Each lane
+    // seeds a register array `acc` from the M-base already in H, accumulates ALL
+    // contacts for its row in registers, then writes H ONCE -> the same H[tridx]
+    // cell is never += by two contacts in sequence, breaking the cross-contact
+    // shared-mem read-after-write dependency chain (the suspected latency cost).
+    // Bit-exact: acc seeded from H means the per-cell summation order matches the
+    // original ((M + c0) + c1 + ...). Full 35-wide #pragma unroll keeps acc in
+    // registers (compile-time index); the j<=i mask handles the lower triangle.
+    for (int i = lane; i < nv; i += 32) {
+        float acc[G1_NV];
+        #pragma unroll
+        for (int j = 0; j < G1_NV; j++) acc[j] = (j <= i) ? H[tridx(i, j)] : 0.0f;
+        for (int r = 0; r < nefc; r++) {
+            if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
+            const float* J = cJ + rd[r] * G1_NV;
+            float Ji = J[i];
+            if (Ji == 0.0f) continue;
+            float DJi = D[r] * Ji;
+            #pragma unroll
+            for (int j = 0; j < G1_NV; j++) acc[j] += DJi * J[j];
+        }
+        #pragma unroll
+        for (int j = 0; j < G1_NV; j++) if (j <= i) H[tridx(i, j)] = acc[j];
+    }
+#else
     for (int r = 0; r < nefc; r++) {
         if (state[r] != ST_QUAD || rt[r] != ROW_CONTACT) continue;
         float Dr = D[r];
         const float* J = cJ + rd[r] * G1_NV;
+#ifdef K7_JDJ_OPT
+        // OPT: a contact's J is sparse (~12/35 nonzero = the contacting leg's
+        // chain + the 6 base dofs), so ~2/3 of the inner H[tridx] += are += 0 —
+        // each still a scattered smem read-modify-write. Skip J[j]==0 (bit-exact:
+        // skips H += 0). This attacks the measured bottleneck (E1-E6 / idiot_k7).
+        for (int i = lane; i < nv; i += 32) {
+            float Ji = J[i];
+            if (Ji == 0.0f) continue;
+            float DJi = Dr * Ji;
+            for (int j = 0; j <= i; j++) {
+                float Jj = J[j];
+                if (Jj != 0.0f) H[tridx(i, j)] += DJi * Jj;
+            }
+        }
+#else
         for (int i = lane; i < nv; i += 32) {
             float Ji = J[i];
             if (Ji == 0.0f) continue;
             float DJi = Dr * Ji;
             for (int j = 0; j <= i; j++) H[tridx(i, j)] += DJi * J[j];
         }
+#endif
     }
+#endif
     __syncwarp();
+#endif
+#endif
+#ifndef K7_BUILD_ONLY   // E1: K7_BUILD_ONLY skips the Cholesky factor entirely
     for (int k = 0; k < nv; k++) {
+#ifdef K7_NO_SYNC        // E2: all lanes do the sqrt; drop the per-column barriers
+        H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
+#else
         if (lane == 0) H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
         __syncwarp();
+#endif
         float invd = 1.0f / H[tridx(k, k)];
         for (int i = k + 1 + lane; i < nv; i += 32) H[tridx(i, k)] *= invd;
+#ifndef K7_NO_SYNC
         __syncwarp();
+#endif
         for (int i = k + 1 + lane; i < nv; i += 32) {
             float Lik = H[tridx(i, k)];
             for (int j = k + 1; j <= i; j++) H[tridx(i, j)] -= Lik * H[tridx(j, k)];
         }
+#ifndef K7_NO_SYNC
         __syncwarp();
+#endif
     }
-#ifndef K7_NO_HWRITE     // probe: skip H->global write (simulate fusing H into smem; SPS-only)
+#endif
+#ifndef K7_NO_HWRITE     // probe: skip the H->global write (simulate fusing H into smem)
     for (int k = lane; k < G1_TRI; k += 32)
         g_H[(size_t)e * (size_t)G1_TRI + k] = H[k];
 #endif
     if (lane == 0 && g_hvalid) g_hvalid[e] = 1;
 #endif  // SPARSE_SOLVER (dense path)
 }
+
+#ifdef SPARSE_SOLVER
+// K7b: thread-per-env UNROLLED LDL factor of the built (unfactored) augmented H.
+// Straight-line code (compile-time offsets, zero runtime indirection) on a local
+// H[417]; sets hvalid after factoring (the split's memo-consistency point).
+__global__ void k7b_factor(int n, const float* __restrict__ g_scal,
+                           float* __restrict__ g_H, int* __restrict__ g_hvalid) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    if (g_scal[(size_t)e * NSCAL + SC_DONE] != 0.0f) return;
+    if (g_hvalid && g_hvalid[e]) return;                 // already factored (memoized)
+    float* g = g_H + (size_t)e * (size_t)G1_TRI;
+    float H[G1_NM_AUG];
+    for (int k = 0; k < G1_NM_AUG; k++) H[k] = g[k];
+    factor_aug_unrolled(H);
+    for (int k = 0; k < G1_NM_AUG; k++) g[k] = H[k];
+    for (int i = 0; i < G1_NV; i++) g[G1_NM_AUG + i] = 1.0f / H[g1c_aug_Madr[i]];
+    if (g_hvalid) g_hvalid[e] = 1;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // K8: grad -> Mgrad (L solve) -> search, Mv, jv, quadGauss, snorm
@@ -1147,7 +1285,7 @@ __global__ void k8_solvesearch(int n, const float* __restrict__ g_qM,
     }
 #else
     float* L = s_L[warp];
-#ifndef K8_NO_HLOAD      // probe: skip H<-global read (simulate fusing H from smem; SPS-only)
+#ifndef K8_NO_HLOAD      // probe: skip the H<-global read (simulate fusing H from smem)
     for (int k = lane; k < G1_TRI; k += 32)
         L[k] = g_H[(size_t)e * (size_t)G1_TRI + k];
 #endif
@@ -1244,7 +1382,8 @@ __device__ __forceinline__ void staged_eval(int nefc, const int* rt, const int* 
 
 #if defined(K78_FUSE) && !defined(SPARSE_SOLVER)
 // FUSED k7+k8: build H + LLT factor in s_H, then solve+search using s_H directly —
-// H/L NEVER round-trips through global (the +23% training-SPS lever). Bit-exact.
+// H/L NEVER round-trips through global. The H round-trip was pure exposed latency
+// (-23% training SPS in probe). Bit-exact: identical build/factor/solve, just in smem.
 __global__ void k78_solve(int n, const float* __restrict__ g_qM,
                           const int* __restrict__ g_nefc, const int* __restrict__ g_rowtype,
                           const int* __restrict__ g_rowdof, const float* __restrict__ g_D,
@@ -1271,6 +1410,7 @@ __global__ void k78_solve(int n, const float* __restrict__ g_qM,
     const int* state = g_state + (size_t)e * NEFC_MAX;
     const float* cJ = g_cJ + (size_t)e * NCROW_MAX * G1_NV;
     float* H = s_H[warp];
+    // build H = M + jointdiag + J'DJ
     for (int k = lane; k < G1_TRI; k += 32) H[k] = 0.0f;
     __syncwarp();
     for (int i = lane; i < nv; i += 32) {
@@ -1297,6 +1437,7 @@ __global__ void k78_solve(int n, const float* __restrict__ g_qM,
         }
     }
     __syncwarp();
+    // LLT factor in place (H -> L)
     for (int k = 0; k < nv; k++) {
         if (lane == 0) H[tridx(k, k)] = sqrtf(H[tridx(k, k)]);
         __syncwarp();
@@ -1309,6 +1450,7 @@ __global__ void k78_solve(int n, const float* __restrict__ g_qM,
         }
         __syncwarp();
     }
+    // solve x = (L L')^-1 (Ma - qfs - qfc) using s_H directly (no global H)
     float* x = s_x[warp]; float* srch = s_srch[warp]; float* Mv = s_Mv[warp];
     for (int i = lane; i < nv; i += 32)
         x[i] = g_Ma[(size_t)e * nv + i] - g_qfs[(size_t)e * nv + i] - g_qfc[(size_t)e * nv + i];

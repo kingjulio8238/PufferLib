@@ -11,10 +11,20 @@
 
 #define TRAJ_MAGIC   0x47315452u  // "G1TR"
 #define TRAJ_VERSION 2
+// dims default to G1; override with -DTRAJ_NQ=.. etc. for another robot (Go2:
+// 19/18/12/14). record_traj.c and the CUDA loader must compile with the SAME.
+#ifndef TRAJ_NQ
 #define TRAJ_NQ      36
+#endif
+#ifndef TRAJ_NV
 #define TRAJ_NV      35
+#endif
+#ifndef TRAJ_NU
 #define TRAJ_NU      29
+#endif
+#ifndef TRAJ_NBODY
 #define TRAJ_NBODY   31
+#endif
 #define TRAJ_NCONMAX 64
 
 enum { TRAJ_SCEN_AIR = 0, TRAJ_SCEN_STAND = 1, TRAJ_SCEN_RANDOM = 2 };

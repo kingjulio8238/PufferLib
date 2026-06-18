@@ -58,6 +58,17 @@ void my_gpu_config(float action_scale, float w_track_lin, float w_track_ang,
                    float w_lin_vel_z, float w_ang_vel_xy, float w_orientation,
                    float w_torque, float w_action_rate, float w_alive,
                    float w_termination, int max_episode_len);
+/* domain-randomization config (Phase 1); all kwargs optional, default = OFF */
+void my_gpu_config_dr(int dr_enable, float noise_angvel, float noise_gravity,
+                      float noise_dofpos, float noise_dofvel, int push_interval,
+                      float push_vel, float init_basevel, float fric_lo,
+                      float fric_hi, float mass_lo, float mass_hi);
+
+/* optional kwarg with default (dict_get asserts on missing; dict_get_unsafe doesn't) */
+static double kw(Dict* k, const char* key, double dflt) {
+    DictItem* it = dict_get_unsafe(k, key);
+    return it ? it->value : dflt;
+}
 
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
@@ -75,6 +86,21 @@ void my_init(Env* env, Dict* kwargs) {
             (float)dict_get(kwargs, "w_alive")->value,
             (float)dict_get(kwargs, "w_termination")->value,
             (int)dict_get(kwargs, "max_episode_len")->value);
+        /* DR: every field optional & defaults to OFF -> recipes without a
+         * [domain_rand] block are bit-identical to the pre-DR baseline. */
+        my_gpu_config_dr(
+            (int)kw(kwargs, "dr_enable", 0),
+            (float)kw(kwargs, "dr_noise_angvel", 0.0),
+            (float)kw(kwargs, "dr_noise_gravity", 0.0),
+            (float)kw(kwargs, "dr_noise_dofpos", 0.0),
+            (float)kw(kwargs, "dr_noise_dofvel", 0.0),
+            (int)kw(kwargs, "dr_push_interval", 0),
+            (float)kw(kwargs, "dr_push_vel", 0.0),
+            (float)kw(kwargs, "dr_init_basevel", 0.0),
+            (float)kw(kwargs, "dr_fric_lo", 1.0),
+            (float)kw(kwargs, "dr_fric_hi", 1.0),
+            (float)kw(kwargs, "dr_mass_lo", 1.0),
+            (float)kw(kwargs, "dr_mass_hi", 1.0));
         configured = 1;
     }
 }
