@@ -32,7 +32,13 @@ __device__ __forceinline__ int tridx(int i, int j) { return i * (i + 1) / 2 + j;
 __global__ void k1_fk_compos(int n, const float* __restrict__ g_qpos,
                              float* __restrict__ g_xpos, float* __restrict__ g_xquat,
                              float* __restrict__ g_com, float* __restrict__ g_cinert,
-                             float* __restrict__ g_cdof) {
+                             float* __restrict__ g_cdof,
+                             const float* __restrict__ g_mass) {
+    // DR mass scale (g_mass[e]): uniform scale of every body's composite inertia
+    // (cinert) -> uniform mass+inertia scale. COM is computed before this and is
+    // scale-invariant, so it is unaffected; gravity accel stays mass-invariant
+    // (k3 RNE forces cinert*cacc with cacc=-g) while control/contact accel scales
+    // with 1/mass. nullptr (go2/benches) or g_mass[e]==1 -> bit-exact baseline.
     __shared__ float s_qpos[SWARPS][S_NQ];
     __shared__ float s_xpos[SWARPS][S_X3];
     __shared__ float s_xquat[SWARPS][S_X4];
@@ -84,6 +90,7 @@ __global__ void k1_fk_compos(int n, const float* __restrict__ g_qpos,
     __syncwarp();
 
     // cinert (registers -> global)
+    float ms = g_mass ? g_mass[e] : 1.0f;   // DR mass scale (1.0 = bit-exact baseline)
     if (lane >= 1 && lane < G1_NBODY) {
         int i = lane;
         float iq[4], mat[9], dif[3], ci[10];
@@ -93,7 +100,7 @@ __global__ void k1_fk_compos(int n, const float* __restrict__ g_qpos,
         dif[1] = xipos[3*i+1] - com[1];
         dif[2] = xipos[3*i+2] - com[2];
         inert_com(ci, g1c_body_inertia + 3 * i, mat, dif, g1c_body_mass[i]);
-        for (int k = 0; k < 10; k++) g_cinert[(size_t)e * S_CI + 10 * i + k] = ci[k];
+        for (int k = 0; k < 10; k++) g_cinert[(size_t)e * S_CI + 10 * i + k] = ci[k] * ms;
     } else if (lane == 0) {
         for (int k = 0; k < 10; k++) g_cinert[(size_t)e * S_CI + k] = 0.0f;
     }
@@ -601,7 +608,8 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                             float* __restrict__ g_R, float* __restrict__ g_aref,
                             float* __restrict__ g_cJ,
                             const float* __restrict__ g_cdof,
-                            float* __restrict__ g_footc) {  // per-env {L,R} foot contact flags
+                            float* __restrict__ g_footc,  // per-env {L,R} foot contact flags
+                            const float* __restrict__ g_fric) {  // per-env friction scale (DR; nullptr/1.0 = baseline)
 #ifndef K5_SMEM_DIET   // serve read-only xpos/xquat from L2 (free ~6.9KB -> occupancy)
     __shared__ float s_xpos[SWARPS][S_X3];
     __shared__ float s_xquat[SWARPS][S_X4];
@@ -618,6 +626,7 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
+    float fs = g_fric ? g_fric[e] : 1.0f;   // DR friction scale (1.0 = bit-exact baseline)
 #ifdef K5_SMEM_DIET
     const float* xpos = g_xpos + (size_t)e * S_X3;     // L2-served (read-only)
     const float* xquat = g_xquat + (size_t)e * S_X4;
@@ -788,8 +797,8 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
             }
             crow += 1;
         } else {
-            float mu0 = g1c_pair_friction[5 * p + 0];
-            float mu1 = g1c_pair_friction[5 * p + 1];
+            float mu0 = g1c_pair_friction[5 * p + 0] * fs;
+            float mu1 = g1c_pair_friction[5 * p + 1] * fs;
             for (int i = lane; i < G1_NV; i += 32) {
                 float j0 = jd[0 * G1_NV + i], j1 = jd[1 * G1_NV + i], j2 = jd[2 * G1_NV + i];
                 gcJ[(crow + 0) * G1_NV + i] = j0 + mu0 * j1;
@@ -848,7 +857,7 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                 dA = tran;
             } else {
                 int k_in = (rd - (rd / 4) * 4) / 2;
-                float mu = g1c_pair_friction[5 * p + k_in];
+                float mu = g1c_pair_friction[5 * p + k_in] * fs;
                 dA = tran + mu * mu * tran;
             }
         }
@@ -876,7 +885,7 @@ __global__ void k5_assemble(int n, const float* __restrict__ g_qpos,
                 int r0 = r - 3;   // rows r0..r0+3 are this contact's pyramid
                 float R0 = g_R[(size_t)e * NEFC_MAX + r0];
                 float R1 = R0 / SOL_IMPRATIO;
-                float mu = g1c_pair_friction[5 * p] * sqrtf(R1 / R0);
+                float mu = g1c_pair_friction[5 * p] * fs * sqrtf(R1 / R0);
                 float Rpy = 2.0f * mu * mu * R0;
                 for (int k = 0; k < 4; k++) g_R[(size_t)e * NEFC_MAX + r0 + k] = Rpy;
                 r = r0 - 1;

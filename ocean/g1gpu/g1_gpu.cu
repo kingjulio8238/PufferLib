@@ -182,7 +182,7 @@ __global__ void k_init_consts(void) {
 __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
                             float* g_qpos, float* g_qvel, float* g_ws,
                             float* g_prev, float* g_cmd, int* g_tick,
-                            float* g_eplog) {
+                            float* g_eplog, float* g_fric, float* g_mass) {
     for (int k = lane; k < S_NQ; k += 32) g_qpos[(size_t)e * S_NQ + k] = g1c_key_qpos[k];
     for (int k = lane; k < S_NV; k += 32) {
         g_qvel[(size_t)e * S_NV + k] = 0.0f;
@@ -207,6 +207,14 @@ __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
             for (int k = 0; k < 6; k++)
                 g_qvel[(size_t)e * S_NV + k] = g1e_init_basevel * urand_pm1(&rng);
         }
+        // DR per-env friction & mass scale (resampled each reset; read by k5/k1).
+        // Always written 1.0 when off (no RNG draw) so the kernels multiply
+        // unconditionally and stay bit-exact (x1.0).
+        g_fric[e] = 1.0f; g_mass[e] = 1.0f;
+        if (g1e_dr_enable) {
+            g_fric[e] = g1e_fric_lo + (g1e_fric_hi - g1e_fric_lo) * urand_01(&rng);
+            g_mass[e] = g1e_mass_lo + (g1e_mass_hi - g1e_mass_lo) * urand_01(&rng);
+        }
         g_rng[e] = rng;
         g_tick[e] = 0;
         g_eplog[(size_t)e * EPLOG_N + 0] = 0.0f;
@@ -220,7 +228,7 @@ __device__ void env_reset_g(int e, int lane, unsigned int* g_rng,
 __global__ void k_reset_all(int n, unsigned int seed, unsigned int* g_rng,
                             float* g_qpos, float* g_qvel, float* g_ws,
                             float* g_prev, float* g_cmd, int* g_tick,
-                            float* g_eplog) {
+                            float* g_eplog, float* g_fric, float* g_mass) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int e = blockIdx.x * SWARPS + warp;
     if (e >= n) return;
@@ -229,7 +237,8 @@ __global__ void k_reset_all(int n, unsigned int seed, unsigned int* g_rng,
         for (int k = 0; k < EPLOG_N; k++) g_eplog[(size_t)e * EPLOG_N + k] = 0.0f;
     }
     __syncwarp();
-    env_reset_g(e, lane, g_rng, g_qpos, g_qvel, g_ws, g_prev, g_cmd, g_tick, g_eplog);
+    env_reset_g(e, lane, g_rng, g_qpos, g_qvel, g_ws, g_prev, g_cmd, g_tick, g_eplog,
+                g_fric, g_mass);
 }
 
 // write the 96-float obs of the current state (used post-reset and in K_epi)
@@ -315,6 +324,7 @@ __global__ void k_epi(int n,
                       float* __restrict__ g_prev, float* __restrict__ g_cmd,
                       int* __restrict__ g_tick, unsigned int* __restrict__ g_rng,
                       float* __restrict__ g_eplog,
+                      float* __restrict__ g_fric, float* __restrict__ g_mass,
                       float* __restrict__ vec_obs, float* __restrict__ vec_rew,
                       float* __restrict__ vec_term) {
     __shared__ int s_fell[SWARPS], s_to[SWARPS];
@@ -447,7 +457,7 @@ __global__ void k_epi(int n,
 
     if (done) {
         env_reset_g(e, lane, g_rng, g_qpos, g_qvel, g_ws, g_prev, g_cmd, g_tick,
-                    g_eplog);
+                    g_eplog, g_fric, g_mass);
     } else if (lane == 0 && g_tick[e] % ENV_CMD_RESAMPLE == 0) {
         unsigned int rng = g_rng[e];
         if (urand_01(&rng) < 0.1f) {
@@ -492,6 +502,7 @@ static int* p_hvalid;
 static float* p_footc;  // per-env {L,R} foot contact flags (k5 -> k_epi)  // H-memo cache flags; nullptr = memo off (large batch)
 static int *p_ncon, *p_nefc, *p_rowtype, *p_rowdof, *p_rowstash, *p_state;
 static float *p_act, *p_prev, *p_cmd, *p_eplog;
+static float *p_fric, *p_mass;   // per-env DR friction & mass scale (1.0 = baseline)
 static int* p_tick;
 static unsigned int* p_rng;
 static float* h_eplog = NULL;
@@ -540,9 +551,8 @@ extern "C" void my_gpu_config_dr(int dr_enable,
            noise_angvel, noise_gravity, noise_dofpos, noise_dofvel,
            push_interval, push_vel, init_basevel);
     if (fric_lo != 1.0f || fric_hi != 1.0f || mass_lo != 1.0f || mass_hi != 1.0f)
-        printf("g1gpu DR: WARNING friction[%.2f,%.2f]/mass[%.2f,%.2f] randomization is "
-               "STAGED but NOT wired to the physics kernels yet (Phase-1 GPU-co-dev "
-               "remainder) -> IGNORED this run.\n", fric_lo, fric_hi, mass_lo, mass_hi);
+        printf("g1gpu DR: friction[%.2f,%.2f] mass[%.2f,%.2f] (per-env scale, resampled each reset)\n",
+               fric_lo, fric_hi, mass_lo, mass_hi);
 }
 
 extern "C" void my_gpu_init(int total_agents, unsigned int seed) {
@@ -601,6 +611,8 @@ extern "C" void my_gpu_init(int total_agents, unsigned int seed) {
     G1GPU_MALLOC(p_prev, (size_t)n * S_NU);
     G1GPU_MALLOC(p_cmd, (size_t)n * 3);
     G1GPU_MALLOC(p_eplog, (size_t)n * EPLOG_N);
+    G1GPU_MALLOC(p_fric, (size_t)n);   // set to 1.0 by the reset below (env_reset_g)
+    G1GPU_MALLOC(p_mass, (size_t)n);
     CUDA_CHECK(cudaMalloc(&p_tick, (size_t)n * 4));
     CUDA_CHECK(cudaMalloc(&p_rng, (size_t)n * 4));
     h_eplog = (float*)malloc((size_t)n * EPLOG_N * 4);
@@ -608,7 +620,7 @@ extern "C" void my_gpu_init(int total_agents, unsigned int seed) {
     k_init_consts<<<1, 256>>>();
     int blocks = (n + SWARPS - 1) / SWARPS;
     k_reset_all<<<blocks, 32 * SWARPS>>>(n, seed, p_rng, p_qpos, p_qvel, p_ws,
-                                         p_prev, p_cmd, p_tick, p_eplog);
+                                         p_prev, p_cmd, p_tick, p_eplog, p_fric, p_mass);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     printf("g1gpu: initialized %d GPU-native envs (no libmujoco)\n", n);
@@ -618,7 +630,7 @@ extern "C" void my_gpu_reset(void* vec_gpu_obs) {
     int n = g_total;
     int blocks = (n + SWARPS - 1) / SWARPS;
     k_reset_all<<<blocks, 32 * SWARPS>>>(n, 12345u, p_rng, p_qpos, p_qvel, p_ws,
-                                         p_prev, p_cmd, p_tick, p_eplog);
+                                         p_prev, p_cmd, p_tick, p_eplog, p_fric, p_mass);
     k_obs_all<<<blocks, 32 * SWARPS>>>(n, p_qpos, p_qvel, p_prev, p_cmd,
                                        p_tick, (float*)vec_gpu_obs);
     CUDA_CHECK(cudaGetLastError());
@@ -697,6 +709,8 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     float* prev = p_prev + s * S_NU;
     float* cmd = p_cmd + s * 3;
     float* eplog = p_eplog + s * EPLOG_N;
+    float* fric = p_fric + s;
+    float* mass = p_mass + s;
     int* tick = p_tick + s;
     unsigned int* rng = p_rng + s;
     const float* va = vec_actions;             // caller passes offset pointers
@@ -716,7 +730,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
                        // NOT on the critical path (learner/inference-bound); if it
                        // jumps, physics IS the wall. Garbage dynamics, SPS-only.
     for (int k = 0; k < ENV_DECIMATION; k++) {
-        k1_fk_compos<<<blocks, tpb, 0, st>>>(n, qpos, xpos, xquat, com, cinert, cdof);
+        k1_fk_compos<<<blocks, tpb, 0, st>>>(n, qpos, xpos, xquat, com, cinert, cdof, mass);
         k2_crb_factor<<<blocks, tpb, 0, st>>>(n, cinert, cdof, qM, qLD, qLDiagInv);
         k3_rne_act_solve<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ctrl, S_NU, cinert,
                                                  cdof, qLD, qLDiagInv, qfs, qas, af);
@@ -728,7 +742,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
         k5_assemble<<<blocks, tpb, 0, st>>>(n, qpos, qvel, xpos, xquat, com, ncon,
                                             nefc, condist, rowtype, rowdof, rowsign,
                                             rowstash, rpos, D, R, aref, cJ, cdof,
-                                            footc);
+                                            footc, fric);
 #ifndef SKIP_SOLVER   // ceiling probe: skip the whole Newton solver (k6 + SOL_ITER
                       // x [k7..k10]) and integrate the unconstrained smooth accel
                       // (qas) instead of the constrained qaccF. Garbage contacts,
@@ -774,7 +788,7 @@ extern "C" void my_gpu_step_range(void* stream_v, int start, int count,
     }
 #endif  // SKIP_PHYSICS
     k_epi<<<blocks, tpb, 0, st>>>(n, qpos, qvel, ws, xpos, footc, af, act, prev,
-                                  cmd, tick, rng, eplog, vo, vr, vt);
+                                  cmd, tick, rng, eplog, fric, mass, vo, vr, vt);
     };
 
 #ifdef GRAPH_ENV_STEP
